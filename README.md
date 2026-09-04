@@ -11,7 +11,7 @@ Auto Area Loot automatically loots nearby corpses when it is safe to do so.
 
 ## API requirement
 
-Auto Area Loot requires the `C_Loot.LootAllCorpses` function provided by `!!!ClassicAPI`. It checks for that function at runtime and displays a chat message if it is unavailable.
+Auto Area Loot requires the `C_Loot.LootAllCorpses` function provided by `ClassicAPI`. It checks for that function at runtime and displays a chat message if it is unavailable.
 
 `NampowerSettings` / Nampower is optional and provides a more reliable death event.
 
