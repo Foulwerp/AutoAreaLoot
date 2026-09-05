@@ -1,38 +1,24 @@
-local DEATH_LOOT_DELAY = 0.15
-local STOP_LOOT_DELAY = 0.05
-local LOOT_RETRY_DELAY = 0.05
+local DEATH_LOOT_DELAY = 0.10
 local defaults = {
     enabled = true,
     minimapAngle = 225,
 }
 
 AutoAreaLootDB = AutoAreaLootDB or {}
-if AutoAreaLootDB.enabled == nil and AutoAreaLootDB.autoLootNearby ~= nil then
-    AutoAreaLootDB.enabled = AutoAreaLootDB.autoLootNearby
-end
 for key, value in pairs(defaults) do
     if type(AutoAreaLootDB[key]) ~= type(value) then
         AutoAreaLootDB[key] = value
     end
 end
-AutoAreaLootDB.autoLootNearby = nil
-AutoAreaLootDB.onDeath = nil
-AutoAreaLootDB.onStopMoving = nil
-AutoAreaLootDB.onCombatEnd = nil
-AutoAreaLootDB.showSummary = nil
-AutoAreaLootDB.verboseLogging = nil
 
 local state = {
     pendingLoot = false,
-    lootScheduled = false,
     manualLootOpen = false,
-    automationID = 0,
 }
 
 local settingsMenu
 local minimapButton
 local eventFrame
-local ScheduleAutomaticLoot
 local missingClassicAPIWarningShown = false
 
 local function HasClassicAPILoot()
@@ -46,7 +32,7 @@ local function HasClassicAPILoot()
     return false
 end
 
-local function StartLootWalk()
+local function LootNearbyCorpses()
     if not AutoAreaLootDB.enabled or not HasClassicAPILoot() then return false end
 
     if state.manualLootOpen then
@@ -54,33 +40,28 @@ local function StartLootWalk()
         return false
     end
 
-    state.pendingLoot = false
-    return C_Loot.LootAllCorpses() and true or false
-end
-
-ScheduleAutomaticLoot = function(delay)
-    if not AutoAreaLootDB.enabled or not HasClassicAPILoot() or state.lootScheduled then return end
-    state.lootScheduled = true
-    local automationID = state.automationID
-    C_Timer.After(delay or 0, function()
-        if automationID ~= state.automationID then return end
-        state.lootScheduled = false
-        StartLootWalk()
-    end)
+    local started = C_Loot.LootAllCorpses() and true or false
+    if not started and type(C_Loot.IsScanInProgress) == "function" and C_Loot.IsScanInProgress() then
+        state.pendingLoot = true
+    end
+    return started
 end
 
 eventFrame = CreateFrame("Frame")
-eventFrame:RegisterEvent("LOOT_OPENED")
-eventFrame:RegisterEvent("LOOT_CLOSED")
-eventFrame:RegisterEvent("PLAYER_LEAVING_WORLD")
 local function IsEventAvailable(eventName)
     return C_EventUtils
         and type(C_EventUtils.IsEventValid) == "function"
         and C_EventUtils.IsEventValid(eventName)
 end
 
+eventFrame:RegisterEvent("LOOT_OPENED")
+eventFrame:RegisterEvent("LOOT_CLOSED")
+eventFrame:RegisterEvent("PLAYER_LEAVING_WORLD")
 if IsEventAvailable("PLAYER_STOPPED_MOVING") then
     eventFrame:RegisterEvent("PLAYER_STOPPED_MOVING")
+end
+if IsEventAvailable("LOOT_SCAN_COMPLETED") then
+    eventFrame:RegisterEvent("LOOT_SCAN_COMPLETED")
 end
 if IsEventAvailable("UNIT_DIED") then
     eventFrame:RegisterEvent("UNIT_DIED")
@@ -90,20 +71,18 @@ end
 
 eventFrame:SetScript("OnEvent", function()
     if event == "PLAYER_LEAVING_WORLD" then
-        state.automationID = state.automationID + 1
         state.pendingLoot = false
-        state.lootScheduled = false
         state.manualLootOpen = false
         return
     end
 
     if event == "PLAYER_STOPPED_MOVING" then
-        ScheduleAutomaticLoot(STOP_LOOT_DELAY)
+        LootNearbyCorpses()
         return
     end
 
     if event == "UNIT_DIED" or event == "CHAT_MSG_COMBAT_HOSTILE_DEATH" then
-        ScheduleAutomaticLoot(DEATH_LOOT_DELAY)
+        C_Timer.After(DEATH_LOOT_DELAY, LootNearbyCorpses)
         return
     end
 
@@ -114,9 +93,14 @@ eventFrame:SetScript("OnEvent", function()
 
     if event == "LOOT_CLOSED" then
         state.manualLootOpen = false
+        LootNearbyCorpses()
+        return
+    end
+
+    if event == "LOOT_SCAN_COMPLETED" then
         if state.pendingLoot then
             state.pendingLoot = false
-            ScheduleAutomaticLoot(LOOT_RETRY_DELAY)
+            LootNearbyCorpses()
         end
         return
     end
@@ -138,11 +122,6 @@ local function AddMenuToggle(key, text, level)
     info.keepShownOnClick = 1
     info.func = function()
         AutoAreaLootDB[key] = not AutoAreaLootDB[key]
-        if not AutoAreaLootDB.enabled then
-            state.automationID = state.automationID + 1
-            state.pendingLoot = false
-            state.lootScheduled = false
-        end
     end
     UIDropDownMenu_AddButton(info, level)
 end
