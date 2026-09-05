@@ -1,4 +1,5 @@
-local DEATH_LOOT_DELAY = 0.10
+local DEATH_LOOT_DELAY = 0.15
+local STOP_LOOT_DELAY = 0.05
 local LOOT_RETRY_DELAY = 0.05
 local defaults = {
     enabled = true,
@@ -22,7 +23,6 @@ AutoAreaLootDB.showSummary = nil
 AutoAreaLootDB.verboseLogging = nil
 
 local state = {
-    walkActive = false,
     pendingLoot = false,
     lootScheduled = false,
     manualLootOpen = false,
@@ -41,50 +41,21 @@ local function HasClassicAPILoot()
     end
     if not missingClassicAPIWarningShown then
         missingClassicAPIWarningShown = true
-        DEFAULT_CHAT_FRAME:AddMessage("Auto Area Loot requires !!!ClassicAPI to function.")
+        DEFAULT_CHAT_FRAME:AddMessage("Auto Area Loot requires the ClassicAPI DLL with C_Loot.LootAllCorpses.")
     end
     return false
 end
 
-local function IsPlayerMoving()
-    return GetUnitSpeed and (GetUnitSpeed("player") or 0) > 0
-end
-
-local function IsLootWalkInProgress()
-    if C_Loot and type(C_Loot.IsScanInProgress) == "function" then
-        return C_Loot.IsScanInProgress()
-    end
-    return state.walkActive
-end
-
-local function HasNearbyLootableCorpse()
-    if not C_Loot or type(C_Loot.GetNearbyLootableUnits) ~= "function" then return true end
-    local units = C_Loot.GetNearbyLootableUnits()
-    return units and next(units) ~= nil
-end
-
 local function StartLootWalk()
     if not AutoAreaLootDB.enabled or not HasClassicAPILoot() then return false end
-    if IsPlayerMoving() then return false end
 
-    if state.manualLootOpen or IsLootWalkInProgress() then
+    if state.manualLootOpen then
         state.pendingLoot = true
         return false
     end
 
-    if not HasNearbyLootableCorpse() then
-        state.pendingLoot = false
-        return false
-    end
-
     state.pendingLoot = false
-    state.walkActive = true
-    if not C_Loot.LootAllCorpses() then
-        state.walkActive = false
-        state.pendingLoot = IsLootWalkInProgress() and true or false
-        return false
-    end
-    return true
+    return C_Loot.LootAllCorpses() and true or false
 end
 
 ScheduleAutomaticLoot = function(delay)
@@ -99,12 +70,19 @@ ScheduleAutomaticLoot = function(delay)
 end
 
 eventFrame = CreateFrame("Frame")
-eventFrame:RegisterEvent("LOOT_SCAN_COMPLETED")
 eventFrame:RegisterEvent("LOOT_OPENED")
 eventFrame:RegisterEvent("LOOT_CLOSED")
-eventFrame:RegisterEvent("PLAYER_STOPPED_MOVING")
 eventFrame:RegisterEvent("PLAYER_LEAVING_WORLD")
-if GetNampowerVersion then
+local function IsEventAvailable(eventName)
+    return C_EventUtils
+        and type(C_EventUtils.IsEventValid) == "function"
+        and C_EventUtils.IsEventValid(eventName)
+end
+
+if IsEventAvailable("PLAYER_STOPPED_MOVING") then
+    eventFrame:RegisterEvent("PLAYER_STOPPED_MOVING")
+end
+if IsEventAvailable("UNIT_DIED") then
     eventFrame:RegisterEvent("UNIT_DIED")
 else
     eventFrame:RegisterEvent("CHAT_MSG_COMBAT_HOSTILE_DEATH")
@@ -113,7 +91,6 @@ end
 eventFrame:SetScript("OnEvent", function()
     if event == "PLAYER_LEAVING_WORLD" then
         state.automationID = state.automationID + 1
-        state.walkActive = false
         state.pendingLoot = false
         state.lootScheduled = false
         state.manualLootOpen = false
@@ -121,9 +98,7 @@ eventFrame:SetScript("OnEvent", function()
     end
 
     if event == "PLAYER_STOPPED_MOVING" then
-        if not IsPlayerMoving() then
-            ScheduleAutomaticLoot(0)
-        end
+        ScheduleAutomaticLoot(STOP_LOOT_DELAY)
         return
     end
 
@@ -146,13 +121,6 @@ eventFrame:SetScript("OnEvent", function()
         return
     end
 
-    if event == "LOOT_SCAN_COMPLETED" then
-        state.walkActive = false
-        if state.pendingLoot then
-            state.pendingLoot = false
-            ScheduleAutomaticLoot(0)
-        end
-    end
 end)
 
 local function SetMinimapPosition()

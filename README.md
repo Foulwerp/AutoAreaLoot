@@ -4,16 +4,16 @@ Auto Area Loot automatically loots nearby corpses when it is safe to do so.
 
 ## Behavior
 
-- Loots nearby corpses when an NPC dies
+- Loots nearby corpses when an NPC death event fires
 - Loots nearby corpses when movement stops
 - Avoids interrupting manual loot windows
 - One minimap toggle enables or disables automatic looting
 
 ## API requirement
 
-Auto Area Loot requires the `C_Loot.LootAllCorpses` function provided by `ClassicAPI`. It checks for that function at runtime and displays a chat message if it is unavailable.
+Auto Area Loot requires the `C_Loot.LootAllCorpses` function provided by the ClassicAPI DLL. It checks for that function at runtime and displays a chat message if it is unavailable.
 
-`NampowerSettings` / Nampower is optional and provides a more reliable death event.
+Nampower is optional. When its `UNIT_DIED` event is available, the addon uses it; otherwise it falls back to `CHAT_MSG_COMBAT_HOSTILE_DEATH`.
 
 ## Installation
 
