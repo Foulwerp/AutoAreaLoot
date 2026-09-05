@@ -7,7 +7,7 @@ Auto Area Loot automatically loots nearby corpses when it is safe to do so.
 - Loots nearby corpses when an NPC death event fires
 - Loots nearby corpses when movement stops
 - Avoids interrupting manual loot windows
-- One minimap toggle enables or disables automatic looting
+- Slash commands enable, disable, or report the addon status
 
 ## API requirement
 
@@ -29,6 +29,10 @@ The addon should be installed as:
 Interface/AddOns/AutoAreaLoot
 ```
 
-## Settings
+## Commands
 
-Click the Auto Area Loot coin icon on the minimap and toggle **Enable automatic looting**. Drag the icon to reposition it.
+```text
+/aal on
+/aal off
+/aal status
+```
