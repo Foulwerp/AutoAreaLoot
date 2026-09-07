@@ -6,7 +6,7 @@ AutoAreaLoot automatically loots nearby corpses when it is safe to do so.
 
 - Loots nearby corpses when an NPC death event fires
 - Individually configurable death and movement-stop triggers
-- Optional in-combat looting, disabled by default
+- Optional in-combat looting, enabled by default
 - Coalesces combat triggers into one final loot pass when combat ends
 - Avoids interrupting manual loot windows
 - Coalesces death bursts and ignores new triggers while a ClassicAPI loot walk is already active

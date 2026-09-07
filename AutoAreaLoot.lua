@@ -3,8 +3,8 @@ local defaults = {
     enabled = true,
     lootOnDeath = true,
     lootOnStop = true,
-    lootInCombat = false,
-    settingsVersion = 2,
+    lootInCombat = true,
+    settingsVersion = 3,
 }
 
 local state = {
@@ -20,12 +20,17 @@ local function InitializeSettings()
         AutoAreaLootDB = {}
     end
 
-    if AutoAreaLootDB.settingsVersion ~= defaults.settingsVersion then
+    local settingsVersion = tonumber(AutoAreaLootDB.settingsVersion) or 0
+    if settingsVersion < 2 then
         if type(AutoAreaLootDB.autoLootOutOfCombat) == "boolean" then
             AutoAreaLootDB.lootOnStop = AutoAreaLootDB.autoLootOutOfCombat
         end
         AutoAreaLootDB.lootOnDeath = true
-        AutoAreaLootDB.lootInCombat = false
+    end
+    if settingsVersion < 3 then
+        AutoAreaLootDB.lootInCombat = true
+    end
+    if settingsVersion < defaults.settingsVersion then
         AutoAreaLootDB.autoLootOutOfCombat = nil
         AutoAreaLootDB.settingsVersion = defaults.settingsVersion
     end
