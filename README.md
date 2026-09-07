@@ -5,12 +5,13 @@ AutoAreaLoot automatically loots nearby corpses when it is safe to do so.
 ## Behavior
 
 - Loots nearby corpses when an NPC death event fires
-- Can loot immediately during combat or wait until combat ends
-- Optionally loots nearby corpses when movement stops out of combat
+- Individually configurable death and movement-stop triggers
+- Optional in-combat looting, disabled by default
+- Coalesces combat triggers into one final loot pass when combat ends
 - Avoids interrupting manual loot windows
 - Coalesces death bursts and ignores new triggers while a ClassicAPI loot walk is already active
 - Closing a manual loot window does not start another area-loot pass
-- `/aal` opens a small settings panel with enable, combat, and out-of-combat toggles
+- `/aal` opens a small settings panel with enable, death, movement-stop, and combat toggles
 - Slash commands can still enable, disable, or report the addon status
 
 ## API requirement

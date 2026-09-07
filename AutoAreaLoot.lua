@@ -1,14 +1,16 @@
 local DEATH_LOOT_DELAY = 0.10
 local defaults = {
     enabled = true,
-    lootInCombat = true,
-    autoLootOutOfCombat = true,
+    lootOnDeath = true,
+    lootOnStop = true,
+    lootInCombat = false,
+    settingsVersion = 2,
 }
 
 local state = {
     initialized = false,
     manualLootOpen = false,
-    pendingDeathLoot = false,
+    pendingCombatLoot = false,
 }
 
 local configFrame
@@ -17,6 +19,17 @@ local function InitializeSettings()
     if type(AutoAreaLootDB) ~= "table" then
         AutoAreaLootDB = {}
     end
+
+    if AutoAreaLootDB.settingsVersion ~= defaults.settingsVersion then
+        if type(AutoAreaLootDB.autoLootOutOfCombat) == "boolean" then
+            AutoAreaLootDB.lootOnStop = AutoAreaLootDB.autoLootOutOfCombat
+        end
+        AutoAreaLootDB.lootOnDeath = true
+        AutoAreaLootDB.lootInCombat = false
+        AutoAreaLootDB.autoLootOutOfCombat = nil
+        AutoAreaLootDB.settingsVersion = defaults.settingsVersion
+    end
+
     for key, value in pairs(defaults) do
         if type(AutoAreaLootDB[key]) ~= type(value) then
             AutoAreaLootDB[key] = value
@@ -47,6 +60,7 @@ local function LootNearbyCorpses()
     if not state.initialized or not AutoAreaLootDB.enabled or not HasClassicAPILoot() then return false end
 
     if IsPlayerInCombat() and not AutoAreaLootDB.lootInCombat then
+        state.pendingCombatLoot = true
         return false
     end
 
@@ -67,9 +81,6 @@ end
 
 local function ScheduleDeathLoot()
     if not state.initialized or not AutoAreaLootDB.enabled then return end
-
-    state.pendingDeathLoot = true
-    if IsPlayerInCombat() and not AutoAreaLootDB.lootInCombat then return end
     if state.deathTimer then return end
     if not HasClassicAPILoot() or not C_Timer or type(C_Timer.After) ~= "function" then return end
 
@@ -79,8 +90,6 @@ local function ScheduleDeathLoot()
     C_Timer.After(DEATH_LOOT_DELAY, function()
         if state.deathTimer ~= token then return end
         state.deathTimer = nil
-        if IsPlayerInCombat() and not AutoAreaLootDB.lootInCombat then return end
-        state.pendingDeathLoot = false
         LootNearbyCorpses()
     end)
 end
@@ -89,7 +98,7 @@ local function SetEnabled(enabled)
     AutoAreaLootDB.enabled = enabled and true or false
     if not AutoAreaLootDB.enabled then
         state.deathTimer = nil
-        state.pendingDeathLoot = false
+        state.pendingCombatLoot = false
     end
 end
 
@@ -108,8 +117,6 @@ local function CreateCheckButton(name, parent, label, y, setting)
         AutoAreaLootDB[this.setting] = this:GetChecked() and true or false
         if this.setting == "enabled" then
             SetEnabled(AutoAreaLootDB.enabled)
-        elseif this.setting == "lootInCombat" and AutoAreaLootDB.lootInCombat and state.pendingDeathLoot then
-            ScheduleDeathLoot()
         end
     end)
     return check
@@ -118,8 +125,9 @@ end
 local function RefreshConfigPanel()
     if not configFrame or not state.initialized then return end
     configFrame.enabledCheck:SetChecked(AutoAreaLootDB.enabled)
+    configFrame.deathCheck:SetChecked(AutoAreaLootDB.lootOnDeath)
+    configFrame.stopCheck:SetChecked(AutoAreaLootDB.lootOnStop)
     configFrame.combatCheck:SetChecked(AutoAreaLootDB.lootInCombat)
-    configFrame.outOfCombatCheck:SetChecked(AutoAreaLootDB.autoLootOutOfCombat)
 end
 
 local function CreateConfigPanel()
@@ -127,7 +135,7 @@ local function CreateConfigPanel()
 
     configFrame = CreateFrame("Frame", "AutoAreaLootConfigFrame", UIParent)
     configFrame:SetWidth(330)
-    configFrame:SetHeight(190)
+    configFrame:SetHeight(220)
     configFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 80)
     configFrame:SetFrameStrata("DIALOG")
     configFrame:SetMovable(true)
@@ -153,15 +161,17 @@ local function CreateConfigPanel()
     close:SetPoint("TOPRIGHT", configFrame, "TOPRIGHT", -4, -4)
 
     configFrame.enabledCheck = CreateCheckButton(
-        "AutoAreaLootEnabledCheckButton", configFrame, "Enable AutoAreaLoot", -48, "enabled")
+        "AutoAreaLootEnabledCheckButton", configFrame, "Loot enabled", -48, "enabled")
+    configFrame.deathCheck = CreateCheckButton(
+        "AutoAreaLootDeathCheckButton", configFrame, "Loot on death", -82, "lootOnDeath")
+    configFrame.stopCheck = CreateCheckButton(
+        "AutoAreaLootStopCheckButton", configFrame, "Loot on movement stop", -116, "lootOnStop")
     configFrame.combatCheck = CreateCheckButton(
-        "AutoAreaLootCombatCheckButton", configFrame, "Loot immediately while in combat", -82, "lootInCombat")
-    configFrame.outOfCombatCheck = CreateCheckButton(
-        "AutoAreaLootOutOfCombatCheckButton", configFrame, "Auto-loot when movement stops out of combat", -116, "autoLootOutOfCombat")
+        "AutoAreaLootCombatCheckButton", configFrame, "Allow looting in combat", -150, "lootInCombat")
 
     local note = configFrame:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     note:SetPoint("BOTTOMLEFT", configFrame, "BOTTOMLEFT", 22, 19)
-    note:SetText("With the last option off, looting only reacts to NPC deaths.")
+    note:SetText("Combat off: triggers wait for one pass when combat ends.")
 
     configFrame:Hide()
 end
@@ -212,27 +222,44 @@ eventFrame:SetScript("OnEvent", function()
 
     if event == "PLAYER_LEAVING_WORLD" then
         state.deathTimer = nil
-        state.pendingDeathLoot = false
+        state.pendingCombatLoot = false
         state.manualLootOpen = false
         return
     end
 
     if event == "PLAYER_REGEN_ENABLED" then
-        if state.pendingDeathLoot then
+        if state.pendingCombatLoot then
+            state.pendingCombatLoot = false
             ScheduleDeathLoot()
         end
         return
     end
 
     if event == "PLAYER_STOPPED_MOVING" then
-        if AutoAreaLootDB.autoLootOutOfCombat and not IsPlayerInCombat() then
-            LootNearbyCorpses()
+        if AutoAreaLootDB.lootOnStop then
+            if IsPlayerInCombat() then
+                state.pendingCombatLoot = true
+                if AutoAreaLootDB.lootInCombat then
+                    LootNearbyCorpses()
+                end
+            else
+                LootNearbyCorpses()
+            end
         end
         return
     end
 
     if event == "UNIT_DIED" or event == "CHAT_MSG_COMBAT_HOSTILE_DEATH" then
-        ScheduleDeathLoot()
+        if AutoAreaLootDB.lootOnDeath then
+            if IsPlayerInCombat() then
+                state.pendingCombatLoot = true
+                if AutoAreaLootDB.lootInCombat then
+                    ScheduleDeathLoot()
+                end
+            else
+                ScheduleDeathLoot()
+            end
+        end
         return
     end
 
@@ -251,7 +278,6 @@ eventFrame:SetScript("OnEvent", function()
         -- a death timer that was scheduled while it was running, and do not
         -- launch a second walk from the completion event.
         state.deathTimer = nil
-        state.pendingDeathLoot = false
         return
     end
 
@@ -273,8 +299,10 @@ SlashCmdList["AUTOAREA_LOOT"] = function(message)
     elseif command == "status" then
         DEFAULT_CHAT_FRAME:AddMessage(
             "AutoAreaLoot is " .. (AutoAreaLootDB.enabled and "enabled" or "disabled")
+            .. "; death trigger " .. (AutoAreaLootDB.lootOnDeath and "on" or "off")
+            .. "; stop trigger " .. (AutoAreaLootDB.lootOnStop and "on" or "off")
             .. "; combat looting " .. (AutoAreaLootDB.lootInCombat and "on" or "off")
-            .. "; out-of-combat auto-loot " .. (AutoAreaLootDB.autoLootOutOfCombat and "on" or "off") .. ".")
+            .. ".")
     else
         ShowConfigPanel()
     end
