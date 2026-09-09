@@ -12,6 +12,13 @@ AutoAreaLoot automatically loots nearby corpses when it is safe to do so.
 - Coalesces death bursts and ignores new triggers while a ClassicAPI loot walk is already active
 - Closing a manual loot window does not start another area-loot pass
 - `/aal` opens a small settings panel with enable, death, movement-stop, and combat toggles
+- `/aal log` opens a compact, scrollable session loot log
+- Confirms item loot from the player's localized loot messages and filters it against the corpse scan
+- Shows money totals and optionally combines matching item rows
+- Shows newest loot first when rows are uncombined
+- Supports resizing the loot log down to a compact minimum size
+- Remembers the loot log's size and screen position
+- Can optionally open the loot log automatically on login or `/reload`
 - Slash commands can still enable, disable, or report the addon status
 
 ## API requirement
@@ -40,6 +47,7 @@ Interface/AddOns/AutoAreaLoot
 /aal on
 /aal off
 /aal status
+/aal log
 ```
 
 Typing `/aal` without an argument opens or closes the settings panel.
