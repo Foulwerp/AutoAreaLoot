@@ -1,6 +1,8 @@
-local DEATH_LOOT_DELAY = 0.10
+local LOOT_REQUEST_DELAY = 0.10
+local LOOT_EVENT_HISTORY_LIMIT = 500
 local LOOT_CONFIRM_GRACE = 3
 local LOOT_ROW_FONT_SIZE = 10
+local LOOT_TIMESTAMP_WIDTH = 52
 local LOOT_LOG_MIN_WIDTH = 240
 local LOOT_LOG_MIN_HEIGHT = 140
 local LOOT_FONT = "Interface\\AddOns\\AutoAreaLoot\\Fonts\\PTSansNarrow.ttf"
@@ -25,9 +27,11 @@ local defaults = {
 local state = {
     initialized = false,
     manualLootOpen = false,
-    pendingCombatLoot = false,
-    pendingDeathLoot = false,
+    pendingLootRequest = false,
+    lootAfterCombat = false,
+    lootRequestTimer = nil,
     lootEvents = {},
+    lootEventCount = 0,
     lootRecords = {},
     lootRecordByKey = {},
     lootWalkActive = false,
@@ -56,24 +60,100 @@ local validAnchorPoints = {
     BOTTOMRIGHT = true,
 }
 
+local function IsPfUIThemeActive()
+    return pfUI and pfUI.api and pfUI.media and pfUI_config
+        and pfUI_config.appearance and pfUI_config.appearance.border
+end
+
+local function GetPfUIConfigColor(value, fallbackR, fallbackG, fallbackB, fallbackA)
+    if IsPfUIThemeActive() and type(pfUI.api.GetStringColor) == "function"
+        and type(value) == "string" then
+        local ok, r, g, b, a = pcall(pfUI.api.GetStringColor, value)
+        if ok and r ~= nil and g ~= nil and b ~= nil then
+            return r, g, b, a or 1
+        end
+    end
+    return fallbackR, fallbackG, fallbackB, fallbackA
+end
+
+local function GetThemeBackgroundColor()
+    local value = IsPfUIThemeActive()
+        and pfUI_config.appearance.border.background or nil
+    return GetPfUIConfigColor(value, 0.051, 0.067, 0.090, 0.99)
+end
+
+local function GetThemeBorderColor()
+    local value = IsPfUIThemeActive()
+        and pfUI_config.appearance.border.color or nil
+    return GetPfUIConfigColor(value, 0.188, 0.212, 0.239, 1)
+end
+
+local function GetThemeAccentColor()
+    if IsPfUIThemeActive() and PFUI_CLASS_COLORS and type(UnitClass) == "function" then
+        local _, class = UnitClass("player")
+        local color = class and PFUI_CLASS_COLORS[class] or nil
+        if color then
+            if type(color.GetRGB) == "function" then
+                local r, g, b = color:GetRGB()
+                if r ~= nil then return r, g, b, 1 end
+            elseif color.r and color.g and color.b then
+                return color.r, color.g, color.b, color.a or 1
+            end
+        end
+    end
+    return 0.345, 0.651, 1.000, 1
+end
+
+local function ApplyThemeBackdrop(frame, transparency, shadow)
+    if IsPfUIThemeActive() and type(pfUI.api.CreateBackdrop) == "function" then
+        local ok = pcall(pfUI.api.CreateBackdrop,
+            frame, nil, true, transparency)
+        if ok then
+            if shadow and type(pfUI.api.CreateBackdropShadow) == "function" then
+                pcall(pfUI.api.CreateBackdropShadow, frame)
+            end
+            return
+        end
+    end
+
+    frame:SetBackdrop({
+        bgFile = "Interface\\Buttons\\WHITE8X8",
+        edgeFile = "Interface\\Buttons\\WHITE8X8",
+        edgeSize = 1,
+    })
+    local br, bg, bb, ba = GetThemeBackgroundColor()
+    local er, eg, eb, ea = GetThemeBorderColor()
+    frame:SetBackdropColor(br, bg, bb, transparency or ba)
+    frame:SetBackdropBorderColor(er, eg, eb, ea)
+end
+
 local function ApplyLootFont(fontString, size)
     if not fontString or type(fontString.SetFont) ~= "function" then return end
+    if IsPfUIThemeActive() and type(pfUI.font_default) == "string"
+        and fontString:SetFont(pfUI.font_default, size, "OUTLINE") then
+        return
+    end
     if not fontString:SetFont(LOOT_FONT, size, "") then
         fontString:SetFont(LOOT_FONT_FALLBACK, size, "")
     end
+end
+
+local function StyleCloseButton(button)
+    if not IsPfUIThemeActive() then return end
+    button:SetWidth(15)
+    button:SetHeight(15)
+    button.label:SetText("")
+    local texture = button:CreateTexture(nil, "ARTWORK")
+    texture:SetAllPoints(button)
+    texture:SetTexture(pfUI.media["img:close"])
+    texture:SetVertexColor(1, 0.25, 0.25, 1)
 end
 
 local function CreateAALButton(parent, width, height, label)
     local button = CreateFrame("Button", nil, parent)
     button:SetWidth(width)
     button:SetHeight(height)
-    button:SetBackdrop({
-        bgFile = "Interface\\Buttons\\WHITE8X8",
-        edgeFile = "Interface\\Buttons\\WHITE8X8",
-        edgeSize = 1,
-    })
-    button:SetBackdropColor(0.129, 0.149, 0.176, 1)
-    button:SetBackdropBorderColor(0.188, 0.212, 0.239, 1)
+    ApplyThemeBackdrop(button, 0.95)
 
     button.label = button:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     button.label:SetPoint("CENTER", button, "CENTER", 0, 0)
@@ -82,12 +162,18 @@ local function CreateAALButton(parent, width, height, label)
     button.label:SetText(label or "")
 
     button:SetScript("OnEnter", function()
-        this:SetBackdropColor(0.090, 0.153, 0.243, 1)
-        this:SetBackdropBorderColor(0.345, 0.651, 1.000, 0.9)
+        local r, g, b = GetThemeAccentColor()
+        this:SetBackdropBorderColor(r, g, b, 1)
+        if not IsPfUIThemeActive() then
+            this:SetBackdropColor(0.090, 0.153, 0.243, 1)
+        end
     end)
     button:SetScript("OnLeave", function()
-        this:SetBackdropColor(0.129, 0.149, 0.176, 1)
-        this:SetBackdropBorderColor(0.188, 0.212, 0.239, 1)
+        local r, g, b, a = GetThemeBorderColor()
+        this:SetBackdropBorderColor(r, g, b, a)
+        if not IsPfUIThemeActive() then
+            this:SetBackdropColor(0.129, 0.149, 0.176, 1)
+        end
     end)
     return button
 end
@@ -132,7 +218,11 @@ local function CreateAALToggle(parent, label, checked, callback)
     local function Paint(hovered)
         local r, g, b
         if toggle.checked then
-            r, g, b = 0.184, 0.506, 0.969
+            if IsPfUIThemeActive() then
+                r, g, b = GetThemeAccentColor()
+            else
+                r, g, b = 0.184, 0.506, 0.969
+            end
         else
             r, g, b = 0.267, 0.302, 0.345
         end
@@ -181,13 +271,15 @@ local function CreateAALScrollbar(parent, scrollFrame, content)
 
     local trackWidth = 4
     local trackCapHeight = 2
+    local trackR, trackG, trackB = GetThemeBorderColor()
+    local thumbR, thumbG, thumbB = GetThemeAccentColor()
     local trackTop = scrollbar:CreateTexture(nil, "BACKGROUND")
     trackTop:SetTexture(CIRCLE_TEXTURE)
     trackTop:SetTexCoord(0, 1, 0, 0.5)
     trackTop:SetWidth(trackWidth)
     trackTop:SetHeight(trackCapHeight)
     trackTop:SetPoint("TOP", scrollbar, "TOP", 0, 0)
-    trackTop:SetVertexColor(0.188, 0.212, 0.239, 0.9)
+    trackTop:SetVertexColor(trackR, trackG, trackB, 0.9)
 
     local trackBottom = scrollbar:CreateTexture(nil, "BACKGROUND")
     trackBottom:SetTexture(CIRCLE_TEXTURE)
@@ -195,13 +287,13 @@ local function CreateAALScrollbar(parent, scrollFrame, content)
     trackBottom:SetWidth(trackWidth)
     trackBottom:SetHeight(trackCapHeight)
     trackBottom:SetPoint("BOTTOM", scrollbar, "BOTTOM", 0, 0)
-    trackBottom:SetVertexColor(0.188, 0.212, 0.239, 0.9)
+    trackBottom:SetVertexColor(trackR, trackG, trackB, 0.9)
 
     local trackCenter = scrollbar:CreateTexture(nil, "BACKGROUND")
     trackCenter:SetTexture("Interface\\Buttons\\WHITE8X8")
     trackCenter:SetPoint("TOPLEFT", trackTop, "BOTTOMLEFT", 0, 0)
     trackCenter:SetPoint("BOTTOMRIGHT", trackBottom, "TOPRIGHT", 0, 0)
-    trackCenter:SetVertexColor(0.188, 0.212, 0.239, 0.9)
+    trackCenter:SetVertexColor(trackR, trackG, trackB, 0.9)
 
     local thumb = CreateFrame("Button", nil, scrollbar)
     local pillWidth = 12
@@ -218,7 +310,7 @@ local function CreateAALScrollbar(parent, scrollFrame, content)
     thumbTop:SetWidth(pillWidth)
     thumbTop:SetHeight(capHeight)
     thumbTop:SetPoint("TOP", thumb, "TOP", 0, -3)
-    thumbTop:SetVertexColor(0.345, 0.651, 1.000, 0.95)
+    thumbTop:SetVertexColor(thumbR, thumbG, thumbB, 0.95)
 
     local thumbBottom = thumb:CreateTexture(nil, "OVERLAY")
     thumbBottom:SetTexture(CIRCLE_TEXTURE)
@@ -226,13 +318,13 @@ local function CreateAALScrollbar(parent, scrollFrame, content)
     thumbBottom:SetWidth(pillWidth)
     thumbBottom:SetHeight(capHeight)
     thumbBottom:SetPoint("BOTTOM", thumb, "BOTTOM", 0, 3)
-    thumbBottom:SetVertexColor(0.345, 0.651, 1.000, 0.95)
+    thumbBottom:SetVertexColor(thumbR, thumbG, thumbB, 0.95)
 
     local thumbCenter = thumb:CreateTexture(nil, "OVERLAY")
     thumbCenter:SetTexture("Interface\\Buttons\\WHITE8X8")
     thumbCenter:SetPoint("TOPLEFT", thumbTop, "BOTTOMLEFT", 0, 0)
     thumbCenter:SetPoint("BOTTOMRIGHT", thumbBottom, "TOPRIGHT", 0, 0)
-    thumbCenter:SetVertexColor(0.345, 0.651, 1.000, 0.95)
+    thumbCenter:SetVertexColor(thumbR, thumbG, thumbB, 0.95)
 
     local maximum = 0
     local dragOffset = 0
@@ -263,7 +355,11 @@ local function CreateAALScrollbar(parent, scrollFrame, content)
         value = math.max(0, math.min(value or 0, maximum))
         scrollFrame:SetVerticalScroll(value)
         UpdateThumb()
+        if scrollFrame.aalOnScrollChanged then
+            scrollFrame.aalOnScrollChanged()
+        end
     end
+    scrollFrame.aalSetScroll = SetScroll
 
     scrollFrame:EnableMouseWheel(true)
     scrollFrame:SetScript("OnMouseWheel", function()
@@ -345,159 +441,235 @@ local function StartLootRowHighlight(row)
     end)
 end
 
-local function RefreshLootLog()
-    if not lootLogContent then return end
+local function GetLootDisplayRecordCount()
+    if AutoAreaLootDB.lootCombine then
+        return table.getn(state.lootRecords)
+    end
+    return table.getn(state.lootEvents)
+end
 
-    local rowHeight = LOOT_ROW_FONT_SIZE + 4
-    local rowWidth = math.max(1, (lootLogContent:GetWidth() or 222))
-    local recordCount = table.getn(state.lootRecords)
-    local contentHeight = recordCount * rowHeight
-    lootLogContent:SetHeight(math.max(contentHeight, 1))
+local function GetLootDisplayRecord(index)
+    if AutoAreaLootDB.lootCombine then
+        return state.lootRecords[index]
+    end
+    local eventCount = table.getn(state.lootEvents)
+    return state.lootEvents[eventCount - index + 1]
+end
 
-    for index = 1, recordCount do
-        local record = state.lootRecords[index]
-        local row = lootLogContent.rows[index]
-        if not row then
-            row = CreateFrame("Frame", nil, lootLogContent)
-            row:SetWidth(rowWidth)
-            row:SetHeight(rowHeight)
-            row.text = row:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
-            row.text:SetPoint("LEFT", row, "LEFT", 3, 0)
-            row.text:SetWidth(math.max(1, rowWidth - 6))
-            row.text:SetHeight(rowHeight)
-            row.text:SetJustifyH("LEFT")
-            row.highlight = row:CreateTexture(nil, "BACKGROUND")
-            row.highlight:SetAllPoints(row)
-            row.highlight:SetTexture(0.345, 0.651, 1.000, 0.32)
-            row.highlight:SetAlpha(0)
-            row.highlight:Hide()
-            lootLogContent.rows[index] = row
+local function CreateLootLogRow()
+    local row = CreateFrame("Frame", nil, lootLogContent)
+    row:EnableMouse(true)
+    row:EnableMouseWheel(true)
+    row.timestamp = row:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+    row.timestamp:SetJustifyH("RIGHT")
+    row.timestamp:SetTextColor(1.000, 0.820, 0.000, 1)
+    row.text = row:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+    row.text:SetJustifyH("LEFT")
+    row.highlight = row:CreateTexture(nil, "BACKGROUND")
+    row.highlight:SetAllPoints(row)
+    local r, g, b = GetThemeAccentColor()
+    row.highlight:SetTexture(r, g, b, 0.32)
+    row.highlight:SetAlpha(0)
+    row.highlight:Hide()
+    row:SetScript("OnEnter", function()
+        if not this.itemLink or not GameTooltip then return end
+        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
+        local ok = pcall(GameTooltip.SetHyperlink, GameTooltip, this.itemLink)
+        if not ok then GameTooltip:Hide() end
+    end)
+    row:SetScript("OnLeave", function()
+        if GameTooltip then GameTooltip:Hide() end
+    end)
+    row:SetScript("OnMouseWheel", function()
+        local scrollFrame = lootLogFrame and lootLogFrame.scrollFrame
+        if scrollFrame and scrollFrame.aalSetScroll then
+            scrollFrame.aalSetScroll(
+                (scrollFrame:GetVerticalScroll() or 0) - arg1 * 14)
         end
-        row:SetHeight(rowHeight)
-        row:SetWidth(rowWidth)
-        row.text:SetHeight(rowHeight)
-        row.text:SetWidth(math.max(1, rowWidth - 6))
-        ApplyLootFont(row.text, LOOT_ROW_FONT_SIZE)
-        row:ClearAllPoints()
-        row:SetPoint("TOPLEFT", lootLogContent, "TOPLEFT", 4, -(index - 1) * rowHeight)
-        if AutoAreaLootDB.lootCombine and record.kind == "item" then
-            row.text:SetText(record.label .. " x" .. record.count)
-        else
-            row.text:SetText(record.message)
-        end
-        if row.boundRecord ~= record then
-            StopLootRowHighlight(row)
-            row.boundRecord = record
-            row.highlightSerial = nil
-        end
-        if AutoAreaLootDB.lootCombine and record.kind == "item"
-            and record.highlightSerial
-            and row.highlightSerial ~= record.highlightSerial then
-            row.highlightSerial = record.highlightSerial
-            StartLootRowHighlight(row)
-        elseif not AutoAreaLootDB.lootCombine then
-            StopLootRowHighlight(row)
-        end
-        row:Show()
+    end)
+    table.insert(lootLogContent.rows, row)
+    return row
+end
+
+local function RefreshVisibleLootRows()
+    if not lootLogFrame or not lootLogContent or not lootLogFrame:IsShown() then
+        return
     end
 
-    for index = recordCount + 1, table.getn(lootLogContent.rows) do
-        StopLootRowHighlight(lootLogContent.rows[index])
-        lootLogContent.rows[index].boundRecord = nil
-        lootLogContent.rows[index]:Hide()
+    local rowHeight = LOOT_ROW_FONT_SIZE + 4
+    local rowWidth = math.max(1, lootLogContent:GetWidth() or 222)
+    local recordCount = GetLootDisplayRecordCount()
+    local scrollFrame = lootLogFrame.scrollFrame
+    local scrollOffset = scrollFrame:GetVerticalScroll() or 0
+    local firstIndex = math.floor(scrollOffset / rowHeight) + 1
+    local visibleCount = math.ceil((scrollFrame:GetHeight() or rowHeight) / rowHeight) + 2
+
+    for poolIndex = 1, visibleCount do
+        local recordIndex = firstIndex + poolIndex - 1
+        local record = recordIndex <= recordCount
+            and GetLootDisplayRecord(recordIndex) or nil
+        local row = lootLogContent.rows[poolIndex] or CreateLootLogRow()
+
+        if record then
+            row:SetHeight(rowHeight)
+            row:SetWidth(rowWidth)
+            row.timestamp:SetHeight(rowHeight)
+            row.text:SetHeight(rowHeight)
+            ApplyLootFont(row.timestamp, LOOT_ROW_FONT_SIZE)
+            ApplyLootFont(row.text, LOOT_ROW_FONT_SIZE)
+            row:ClearAllPoints()
+            row:SetPoint("TOPLEFT", lootLogContent, "TOPLEFT", 4,
+                -(recordIndex - 1) * rowHeight)
+            row.timestamp:ClearAllPoints()
+            row.text:ClearAllPoints()
+            if AutoAreaLootDB.lootCombine then
+                row.timestamp:Hide()
+                row.text:SetPoint("LEFT", row, "LEFT", 3, 0)
+                row.text:SetWidth(math.max(1, rowWidth - 6))
+                row.text:SetText(record.label .. " x" .. record.count)
+            else
+                row.timestamp:SetPoint("LEFT", row, "LEFT", 3, 0)
+                row.timestamp:SetWidth(LOOT_TIMESTAMP_WIDTH)
+                row.timestamp:SetText("[" .. (record.timestamp or "--:--") .. "]")
+                row.timestamp:Show()
+                row.text:SetPoint("LEFT", row, "LEFT",
+                    LOOT_TIMESTAMP_WIDTH + 8, 0)
+                row.text:SetWidth(math.max(1,
+                    rowWidth - LOOT_TIMESTAMP_WIDTH - 11))
+                row.text:SetText(record.message)
+            end
+            if record.kind == "item" then
+                if type(record.key) == "string" then
+                    row.itemLink = record.key
+                elseif tonumber(record.key) then
+                    row.itemLink = "item:" .. tonumber(record.key)
+                else
+                    row.itemLink = nil
+                end
+            else
+                row.itemLink = nil
+            end
+
+            if row.boundRecord ~= record then
+                if GameTooltip and type(GameTooltip.IsOwned) == "function"
+                    and GameTooltip:IsOwned(row) then
+                    GameTooltip:Hide()
+                end
+                StopLootRowHighlight(row)
+                row.boundRecord = record
+                row.highlightSerial = nil
+            end
+            local now = type(GetTime) == "function" and GetTime() or 0
+            if AutoAreaLootDB.lootCombine and record.highlightSerial
+                and record.highlightUntil and record.highlightUntil > now
+                and row.highlightSerial ~= record.highlightSerial then
+                row.highlightSerial = record.highlightSerial
+                StartLootRowHighlight(row)
+            elseif not AutoAreaLootDB.lootCombine
+                or not record.highlightUntil or record.highlightUntil <= now then
+                StopLootRowHighlight(row)
+            end
+            row:Show()
+        else
+            StopLootRowHighlight(row)
+            row.boundRecord = nil
+            row.itemLink = nil
+            row:Hide()
+        end
+    end
+
+    for poolIndex = visibleCount + 1, table.getn(lootLogContent.rows) do
+        local row = lootLogContent.rows[poolIndex]
+        StopLootRowHighlight(row)
+        row.boundRecord = nil
+        row.itemLink = nil
+        row:Hide()
+    end
+end
+
+local function RefreshLootLog()
+    if not lootLogContent or not lootLogFrame or not lootLogFrame:IsShown() then
+        return
+    end
+
+    local rowHeight = LOOT_ROW_FONT_SIZE + 4
+    local recordCount = GetLootDisplayRecordCount()
+    local contentHeight = math.max(recordCount * rowHeight, 1)
+    lootLogContent:SetHeight(contentHeight)
+
+    local scrollFrame = lootLogFrame.scrollFrame
+    local maximum = math.max(0, contentHeight - (scrollFrame:GetHeight() or 1))
+    if (scrollFrame:GetVerticalScroll() or 0) > maximum then
+        scrollFrame:SetVerticalScroll(maximum)
     end
 
     local moneyText = type(GetCoinTextureString) == "function"
         and GetCoinTextureString(state.lootMoney, 9)
         or (state.lootMoney .. " copper")
-    lootLogSummary:SetText("Session loot: " .. table.getn(state.lootEvents))
+    lootLogSummary:SetText("Session loot: " .. state.lootEventCount)
     lootLogMoneySummary:SetText("Money: " .. moneyText)
-    if lootLogFrame:IsShown() then
-        lootLogFrame.scrollFrame:UpdateScrollChildRect()
-    end
+    scrollFrame:UpdateScrollChildRect()
+    RefreshVisibleLootRows()
     if lootLogFrame.scrollbar then
         lootLogFrame.scrollbar:Update()
     end
 end
 
-local function AddLootItem(label, key, count)
-    local record
-    if AutoAreaLootDB.lootCombine then
-        record = state.lootRecordByKey[key]
+local function GetLootTimestamp()
+    if type(date) == "function" then
+        local ok, timestamp = pcall(date, "%H:%M:%S")
+        if ok and type(timestamp) == "string" then return timestamp end
     end
+    if type(GetGameTime) == "function" then
+        local ok, hour, minute = pcall(GetGameTime)
+        if ok and hour ~= nil and minute ~= nil then
+            return string.format("%02d:%02d", hour, minute)
+        end
+    end
+    return "--:--"
+end
 
+local function AppendLootEvent(eventData)
+    state.lootEventCount = state.lootEventCount + 1
+    table.insert(state.lootEvents, eventData)
+    while table.getn(state.lootEvents) > LOOT_EVENT_HISTORY_LIMIT do
+        table.remove(state.lootEvents, 1)
+    end
+end
+
+local function AddLootItem(label, key, count)
+    local record = state.lootRecordByKey[key]
     if record then
         record.count = record.count + count
+        record.label = label
     else
         record = {
             kind = "item",
             key = key,
             label = label,
             count = count,
-            message = label .. (count > 1 and (" x" .. count) or ""),
         }
-        if AutoAreaLootDB.lootCombine then
-            table.insert(state.lootRecords, record)
-        else
-            table.insert(state.lootRecords, 1, record)
-        end
-        if AutoAreaLootDB.lootCombine then
-            state.lootRecordByKey[key] = record
-        end
+        table.insert(state.lootRecords, record)
+        state.lootRecordByKey[key] = record
     end
+
     if AutoAreaLootDB.lootCombine and lootLogFrame
         and lootLogFrame:IsShown() then
         state.lootHighlightSerial = state.lootHighlightSerial + 1
         record.highlightSerial = state.lootHighlightSerial
+        record.highlightUntil =
+            (type(GetTime) == "function" and GetTime() or 0) + 1.20
     end
-    table.insert(state.lootEvents, {
+
+    local message = label .. (count > 1 and (" x" .. count) or "")
+    AppendLootEvent({
         kind = "item",
         label = label,
         key = key,
         count = count,
+        timestamp = GetLootTimestamp(),
+        message = message,
     })
-end
-
-local function RebuildLootRecords()
-    state.lootRecords = {}
-    state.lootRecordByKey = {}
-    if AutoAreaLootDB.lootCombine then
-        for _, eventData in ipairs(state.lootEvents) do
-            if eventData.kind == "item" then
-                local record = state.lootRecordByKey[eventData.key]
-                if record then
-                    record.count = record.count + eventData.count
-                else
-                    record = {
-                        kind = "item",
-                        key = eventData.key,
-                        label = eventData.label,
-                        count = eventData.count,
-                        message = eventData.label .. (eventData.count > 1 and (" x" .. eventData.count) or ""),
-                    }
-                    table.insert(state.lootRecords, record)
-                    state.lootRecordByKey[eventData.key] = record
-                end
-            end
-        end
-    else
-        for index = table.getn(state.lootEvents), 1, -1 do
-            local eventData = state.lootEvents[index]
-            if eventData.kind == "money" then
-                table.insert(state.lootRecords, {
-                    kind = "message",
-                    message = eventData.message,
-                })
-            else
-                table.insert(state.lootRecords, {
-                    kind = "item",
-                    label = eventData.label,
-                    count = eventData.count,
-                    message = eventData.label .. (eventData.count > 1 and (" x" .. eventData.count) or ""),
-                })
-            end
-        end
-    end
 end
 
 local function FormatMoney(amount)
@@ -512,17 +684,12 @@ local function AddLootMoney(amount)
     if amount <= 0 then return end
     local message = FormatMoney(amount)
     state.lootMoney = state.lootMoney + amount
-    table.insert(state.lootEvents, {
+    AppendLootEvent({
         kind = "money",
+        timestamp = GetLootTimestamp(),
         message = message,
         amount = amount,
     })
-    if not AutoAreaLootDB.lootCombine then
-        table.insert(state.lootRecords, 1, {
-            kind = "message",
-            message = message,
-        })
-    end
 end
 
 local function SafeGetMoney()
@@ -830,27 +997,27 @@ local function CreateLootLog()
         SaveLootLogGeometry()
     end)
     lootLogFrame:SetScript("OnHide", SaveLootLogGeometry)
-    lootLogFrame:SetBackdrop({
-        bgFile = "Interface\\Buttons\\WHITE8X8",
-        edgeFile = "Interface\\Buttons\\WHITE8X8",
-        edgeSize = 1,
-    })
-    lootLogFrame:SetBackdropColor(0.051, 0.067, 0.090, 0.99)
-    lootLogFrame:SetBackdropBorderColor(0.188, 0.212, 0.239, 1)
+    ApplyThemeBackdrop(lootLogFrame, 0.90, true)
 
     local header = lootLogFrame:CreateTexture(nil, "BACKGROUND")
     header:SetTexture("Interface\\Buttons\\WHITE8X8")
     header:SetPoint("TOPLEFT", lootLogFrame, "TOPLEFT", 1, -1)
     header:SetPoint("TOPRIGHT", lootLogFrame, "TOPRIGHT", -1, -1)
     header:SetHeight(30)
-    header:SetVertexColor(0.090, 0.153, 0.243, 0.55)
+    if IsPfUIThemeActive() then
+        local r, g, b = GetThemeBackgroundColor()
+        header:SetVertexColor(r, g, b, 0.75)
+    else
+        header:SetVertexColor(0.090, 0.153, 0.243, 0.55)
+    end
 
     local accent = lootLogFrame:CreateTexture(nil, "BORDER")
     accent:SetTexture("Interface\\Buttons\\WHITE8X8")
     accent:SetPoint("TOPLEFT", lootLogFrame, "TOPLEFT", 1, -1)
     accent:SetPoint("TOPRIGHT", lootLogFrame, "TOPRIGHT", -1, -1)
     accent:SetHeight(2)
-    accent:SetVertexColor(0.345, 0.651, 1.000, 0.85)
+    local accentR, accentG, accentB = GetThemeAccentColor()
+    accent:SetVertexColor(accentR, accentG, accentB, 0.85)
 
     local title = lootLogFrame:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
     title:SetPoint("TOP", lootLogFrame, "TOP", 0, -12)
@@ -861,6 +1028,7 @@ local function CreateLootLog()
     local close = CreateAALButton(lootLogFrame, 18, 18, "X")
     close:SetPoint("TOPRIGHT", lootLogFrame, "TOPRIGHT", -6, -6)
     ApplyLootFont(close.label, 9)
+    StyleCloseButton(close)
     close:SetScript("OnClick", function() this:GetParent():Hide() end)
 
     lootLogSummary = lootLogFrame:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
@@ -886,6 +1054,7 @@ local function CreateLootLog()
     lootLogContent.rows = {}
     scrollFrame:SetScrollChild(lootLogContent)
     lootLogFrame.scrollbar = CreateAALScrollbar(lootLogFrame, scrollFrame, lootLogContent)
+    scrollFrame.aalOnScrollChanged = RefreshVisibleLootRows
 
     local resizeGrip = CreateFrame("Button", nil, lootLogFrame)
     resizeGrip:SetWidth(16)
@@ -923,15 +1092,17 @@ local function CreateLootLog()
     clear:SetPoint("BOTTOMLEFT", lootLogFrame, "BOTTOMLEFT", 12, 7)
     clear:SetScript("OnClick", function()
         state.lootEvents = {}
+        state.lootEventCount = 0
         state.lootRecords = {}
         state.lootRecordByKey = {}
         state.lootMoney = 0
+        lootLogFrame.scrollFrame:SetVerticalScroll(0)
         RefreshLootLog()
     end)
 
     local combine = CreateAALToggle(lootLogFrame, "Combine", AutoAreaLootDB.lootCombine, function(checked)
         AutoAreaLootDB.lootCombine = checked
-        RebuildLootRecords()
+        lootLogFrame.scrollFrame:SetVerticalScroll(0)
         RefreshLootLog()
     end)
     combine:SetPoint("BOTTOMLEFT", lootLogFrame, "BOTTOMLEFT", 70, 9)
@@ -1017,78 +1188,105 @@ local function IsLootScanInProgress()
     return ok and inProgress and true or false
 end
 
-local function LootNearbyCorpses(fromDeath)
+local CompleteActiveLootWalk
+
+local function LootNearbyCorpses()
     if not state.initialized or not AutoAreaLootDB.enabled or not HasClassicAPILoot() then return false end
 
     if IsPlayerInCombat() and not AutoAreaLootDB.lootInCombat then
-        state.pendingCombatLoot = true
+        state.pendingLootRequest = true
         return false
     end
 
     if state.manualLootOpen then
-        if fromDeath then
-            state.pendingDeathLoot = true
-        end
+        state.pendingLootRequest = true
         return false
     end
 
     if state.lootWalkActive then
         if IsLootScanInProgress() then
-            if fromDeath then
-                state.pendingDeathLoot = true
-            end
+            state.pendingLootRequest = true
             return false
         end
-        -- Recover if the completion event was missed. Logging state is
-        -- discarded independently and can never keep this gate latched.
-        state.lootWalkActive = false
-        state.activeCapture = nil
+        -- Recover if a later trigger notices that the completion event was
+        -- missed after ClassicAPI already returned to idle.
+        CompleteActiveLootWalk()
     end
 
     if IsLootScanInProgress() then
-        if fromDeath then
-            state.pendingDeathLoot = true
-        end
+        state.pendingLootRequest = true
         return false
     end
 
+    state.pendingLootRequest = false
     local capture = { events = {} }
     state.activeCapture = capture
     state.lootWalkActive = true
     local callOK, callResult = pcall(C_Loot.LootAllCorpses)
     local started = callOK and callResult and true or false
-    state.lootWalkActive = started
     if started then
-        state.deathTimer = nil
+        state.lootRequestTimer = nil
     else
         if state.activeCapture == capture then
             state.activeCapture = nil
+            state.lootWalkActive = false
+        end
+        if IsLootScanInProgress() then
+            state.pendingLootRequest = true
         end
     end
     return started
 end
 
-local function ScheduleDeathLoot()
+local function ScheduleLootRequest()
     if not state.initialized or not AutoAreaLootDB.enabled then return end
-    if state.deathTimer then return end
+    if state.lootRequestTimer then return end
     if not HasClassicAPILoot() or not C_Timer or type(C_Timer.After) ~= "function" then return end
 
     -- One timer per burst; invalidated tokens cannot service a later request.
     local token = {}
-    state.deathTimer = token
-    C_Timer.After(DEATH_LOOT_DELAY, function()
-        if state.deathTimer ~= token then return end
-        state.deathTimer = nil
-        LootNearbyCorpses(true)
+    state.lootRequestTimer = token
+    C_Timer.After(LOOT_REQUEST_DELAY, function()
+        if state.lootRequestTimer ~= token then return end
+        state.lootRequestTimer = nil
+        LootNearbyCorpses()
     end)
+end
+
+CompleteActiveLootWalk = function()
+    if not state.lootWalkActive then return false end
+
+    local capture = state.activeCapture
+    state.lootWalkActive = false
+    state.activeCapture = nil
+
+    if capture then
+        local results = {}
+        if type(C_Loot.GetLastScanResults) == "function" then
+            local resultsOK, returnedResults = pcall(C_Loot.GetLastScanResults)
+            if resultsOK and type(returnedResults) == "table" then
+                results = returnedResults
+            end
+        end
+        -- Any logging failure ends here and cannot affect looting.
+        pcall(CompleteLootCapture, capture, results)
+    end
+    return true
+end
+
+local function ServicePendingLootRequest()
+    if state.pendingLootRequest then
+        state.pendingLootRequest = false
+        ScheduleLootRequest()
+    end
 end
 
 local function SetEnabled(enabled)
     AutoAreaLootDB.enabled = enabled and true or false
     if not AutoAreaLootDB.enabled then
-        state.deathTimer = nil
-        state.pendingCombatLoot = false
-        state.pendingDeathLoot = false
+        state.lootRequestTimer = nil
+        state.pendingLootRequest = false
+        state.lootAfterCombat = false
     end
 end
 
@@ -1126,27 +1324,27 @@ local function CreateConfigPanel()
     configFrame:SetScript("OnDragStart", function() this:StartMoving() end)
     configFrame:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
     configFrame:SetScript("OnShow", RefreshConfigPanel)
-    configFrame:SetBackdrop({
-        bgFile = "Interface\\Buttons\\WHITE8X8",
-        edgeFile = "Interface\\Buttons\\WHITE8X8",
-        edgeSize = 1,
-    })
-    configFrame:SetBackdropColor(0.051, 0.067, 0.090, 0.99)
-    configFrame:SetBackdropBorderColor(0.188, 0.212, 0.239, 1)
+    ApplyThemeBackdrop(configFrame, 0.90, true)
 
     local header = configFrame:CreateTexture(nil, "BACKGROUND")
     header:SetTexture("Interface\\Buttons\\WHITE8X8")
     header:SetPoint("TOPLEFT", configFrame, "TOPLEFT", 1, -1)
     header:SetPoint("TOPRIGHT", configFrame, "TOPRIGHT", -1, -1)
     header:SetHeight(34)
-    header:SetVertexColor(0.090, 0.153, 0.243, 0.55)
+    if IsPfUIThemeActive() then
+        local r, g, b = GetThemeBackgroundColor()
+        header:SetVertexColor(r, g, b, 0.75)
+    else
+        header:SetVertexColor(0.090, 0.153, 0.243, 0.55)
+    end
 
     local accent = configFrame:CreateTexture(nil, "BORDER")
     accent:SetTexture("Interface\\Buttons\\WHITE8X8")
     accent:SetPoint("TOPLEFT", configFrame, "TOPLEFT", 1, -1)
     accent:SetPoint("TOPRIGHT", configFrame, "TOPRIGHT", -1, -1)
     accent:SetHeight(2)
-    accent:SetVertexColor(0.345, 0.651, 1.000, 0.85)
+    local accentR, accentG, accentB = GetThemeAccentColor()
+    accent:SetVertexColor(accentR, accentG, accentB, 0.85)
 
     local title = configFrame:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
     title:SetPoint("TOP", configFrame, "TOP", 0, -10)
@@ -1157,6 +1355,7 @@ local function CreateConfigPanel()
     local close = CreateAALButton(configFrame, 18, 18, "X")
     close:SetPoint("TOPRIGHT", configFrame, "TOPRIGHT", -6, -6)
     ApplyLootFont(close.label, 9)
+    StyleCloseButton(close)
     close:SetScript("OnClick", function() this:GetParent():Hide() end)
 
     configFrame.enabledCheck = CreateCheckButton(
@@ -1226,9 +1425,9 @@ eventFrame:SetScript("OnEvent", function()
     end
 
     if event == "PLAYER_LEAVING_WORLD" then
-        state.deathTimer = nil
-        state.pendingCombatLoot = false
-        state.pendingDeathLoot = false
+        state.lootRequestTimer = nil
+        state.pendingLootRequest = false
+        state.lootAfterCombat = false
         state.manualLootOpen = false
         state.lootWalkActive = false
         state.activeCapture = nil
@@ -1238,9 +1437,10 @@ eventFrame:SetScript("OnEvent", function()
     end
 
     if event == "PLAYER_REGEN_ENABLED" then
-        if state.pendingCombatLoot then
-            state.pendingCombatLoot = false
-            ScheduleDeathLoot()
+        if state.lootAfterCombat or state.pendingLootRequest then
+            state.lootAfterCombat = false
+            state.pendingLootRequest = false
+            ScheduleLootRequest()
         end
         return
     end
@@ -1248,13 +1448,9 @@ eventFrame:SetScript("OnEvent", function()
     if event == "PLAYER_STOPPED_MOVING" then
         if AutoAreaLootDB.lootOnStop then
             if IsPlayerInCombat() then
-                state.pendingCombatLoot = true
-                if AutoAreaLootDB.lootInCombat then
-                    LootNearbyCorpses()
-                end
-            else
-                LootNearbyCorpses()
+                state.lootAfterCombat = true
             end
+            LootNearbyCorpses()
         end
         return
     end
@@ -1262,13 +1458,9 @@ eventFrame:SetScript("OnEvent", function()
     if event == "UNIT_DIED" or event == "CHAT_MSG_COMBAT_HOSTILE_DEATH" then
         if AutoAreaLootDB.lootOnDeath then
             if IsPlayerInCombat() then
-                state.pendingCombatLoot = true
-                if AutoAreaLootDB.lootInCombat then
-                    ScheduleDeathLoot()
-                end
-            else
-                ScheduleDeathLoot()
+                state.lootAfterCombat = true
             end
+            ScheduleLootRequest()
         end
         return
     end
@@ -1280,10 +1472,7 @@ eventFrame:SetScript("OnEvent", function()
 
     if event == "LOOT_CLOSED" then
         state.manualLootOpen = false
-        if state.pendingDeathLoot then
-            state.pendingDeathLoot = false
-            ScheduleDeathLoot()
-        end
+        ServicePendingLootRequest()
         return
     end
 
@@ -1314,28 +1503,8 @@ eventFrame:SetScript("OnEvent", function()
     end
 
     if event == "LOOT_SCAN_COMPLETED" then
-        if state.lootWalkActive then
-            local capture = state.activeCapture
-            state.lootWalkActive = false
-            state.activeCapture = nil
-
-            if capture then
-                local results = {}
-                if type(C_Loot.GetLastScanResults) == "function" then
-                    local resultsOK, returnedResults =
-                        pcall(C_Loot.GetLastScanResults)
-                    if resultsOK and type(returnedResults) == "table" then
-                        results = returnedResults
-                    end
-                end
-                -- Any logging failure ends here and cannot affect looting.
-                pcall(CompleteLootCapture, capture, results)
-            end
-        end
-        if state.pendingDeathLoot then
-            state.pendingDeathLoot = false
-            ScheduleDeathLoot()
-        end
+        CompleteActiveLootWalk()
+        ServicePendingLootRequest()
         return
     end
 

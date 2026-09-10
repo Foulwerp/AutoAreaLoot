@@ -1,7 +1,7 @@
 ## Interface: 11200
 ## Title: AutoAreaLoot
 ## Notes: Event-driven automatic nearby-corpse looting.
-## OptionalDeps: NampowerSettings
+## OptionalDeps: NampowerSettings, pfUI
 ## Version: 1.1.0
 ## SavedVariables: AutoAreaLootDB
 
