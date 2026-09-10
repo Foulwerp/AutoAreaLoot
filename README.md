@@ -5,15 +5,29 @@ AutoAreaLoot automatically loots nearby corpses when it is safe to do so.
 ## Behavior
 
 - Loots nearby corpses when an NPC death event fires
+- Ignores Nampower death events whose units are clearly beyond loot range
 - Individually configurable death and movement-stop triggers
 - Optional in-combat looting, enabled by default
 - Coalesces blocked triggers into one pending loot pass
 - Runs one final pass after combat when a combat-time trigger occurred
 - Avoids interrupting manual loot windows
-- Retains death and movement-stop requests received during an active loot walk
+- Preserves new death requests received during an active loot walk
+- Coalesces same-area movement stops into the active walk, while preserving one
+  follow-up after moving into a new loot area even if the active walk succeeds
+- Limits same-area movement-stop scans to one every 0.5 seconds, but permits an
+  immediate scan after moving at least five yards into a new loot area
+- Waits 0.15 seconds after movement stops and cancels the attempt if movement
+  resumes; death requests received while moving remain queued for that stop
+- Detects actual player speed so RMB strafing, jumping, and other displacement
+  are not dependent on forward/back movement events
+- Uses a bounded latency-adjusted settling period after successful walks,
+  avoiding rescans while loot is still being delivered
 - `/aal` opens a small settings panel with enable, death, movement-stop, and combat toggles
 - `/aal log` opens a compact, scrollable session loot log
+- `/aal debug` opens a bounded, copyable diagnostic trace without flooding chat
 - Confirms item loot from the player's localized loot messages and filters it against the corpse scan
+- Uses corpse GUIDs to prevent repeated scans from creating duplicate live
+  loot-confirmation expectations
 - Shows money totals and optionally combines matching item rows
 - Shows the newest 500 loot events first with timestamps when rows are uncombined
 - Keeps timestamps aligned in a fixed column and shows item tooltips on hover
@@ -53,6 +67,12 @@ Interface/AddOns/AutoAreaLoot
 /aal off
 /aal status
 /aal log
+/aal debug
+/aal debug off
+/aal debug clear
 ```
 
 Typing `/aal` without an argument opens or closes the settings panel.
+The debug window records precise trigger, scheduling, ClassicAPI scan, and loot
+confirmation steps. Choose **Select All** to pause capture and select the trace,
+then press `Ctrl+C` to copy a report.

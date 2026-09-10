@@ -1,10 +1,27 @@
 local LOOT_REQUEST_DELAY = 0.10
+local DEATH_LOOT_REQUEST_DELAY = 0.25
+local POST_SCAN_SETTLE_MIN = 0.35
+local POST_SCAN_SETTLE_MAX = 1.25
+local POST_SCAN_SETTLE_CUSHION = 0.25
+local POST_SCAN_LATENCY_MULTIPLIER = 2
+local STOP_LOOT_GRACE = 0.15
+local STOP_LOOT_GRACE_MOVEMENT_TOLERANCE = 0.20
+local MOVEMENT_SAMPLE_INTERVAL = 0.10
+local MOVEMENT_SPEED_EPSILON = 0.01
+local STOP_LOOT_SAME_AREA_INTERVAL = 0.50
+local STOP_LOOT_MOVEMENT_DISTANCE = 5
+-- The engine's loot test includes creature reach. This deliberately generous
+-- center-distance limit rejects only deaths that are clearly too far away.
+local DEATH_TRIGGER_DISTANCE_LIMIT = 8
 local LOOT_EVENT_HISTORY_LIMIT = 500
 local LOOT_CONFIRM_GRACE = 3
 local LOOT_ROW_FONT_SIZE = 10
 local LOOT_TIMESTAMP_WIDTH = 52
 local LOOT_LOG_MIN_WIDTH = 240
 local LOOT_LOG_MIN_HEIGHT = 140
+local DEBUG_HISTORY_LIMIT = 300
+local DEBUG_LINE_HEIGHT = 12
+local PENDING_LOOT_PRIORITY = { retry = 1, moved = 2, death = 3 }
 local LOOT_FONT = "Interface\\AddOns\\AutoAreaLoot\\Fonts\\PTSansNarrow.ttf"
 local LOOT_FONT_FALLBACK = "Fonts\\FRIZQT__.TTF"
 local CIRCLE_TEXTURE = "Interface\\AddOns\\AutoAreaLoot\\Icons\\Circle.tga"
@@ -27,19 +44,33 @@ local defaults = {
 local state = {
     initialized = false,
     manualLootOpen = false,
-    pendingLootRequest = false,
+    pendingLootReason = nil,
     lootAfterCombat = false,
     lootRequestTimer = nil,
+    lootSettleUntil = nil,
     lootEvents = {},
     lootEventCount = 0,
     lootRecords = {},
     lootRecordByKey = {},
     lootWalkActive = false,
+    lootWalkStartedAt = nil,
+    useSpeedMovement = false,
+    movementStateKnown = false,
+    movementSampleElapsed = 0,
+    playerMoving = false,
+    stopGraceTimer = nil,
+    lastStopLootRequestAt = nil,
+    lastStopPositionX = nil,
+    lastStopPositionY = nil,
+    lastStopPositionZ = nil,
     activeCapture = nil,
     pendingCaptures = {},
     moneyBaseline = nil,
     lootMoney = 0,
     lootHighlightSerial = 0,
+    debugEnabled = false,
+    debugLines = {},
+    debugDirty = false,
 }
 
 local configFrame
@@ -47,6 +78,22 @@ local lootLogFrame
 local lootLogContent
 local lootLogSummary
 local lootLogMoneySummary
+local debugFrame
+local debugEditBox
+local RefreshDebugLog
+
+local function DebugLog(message)
+    if not state.debugEnabled then return end
+    local now = type(GetTime) == "function" and GetTime() or 0
+    local cleanMessage = tostring(message or "")
+    cleanMessage = string.gsub(cleanMessage, "[\r\n]+", " ")
+    table.insert(state.debugLines,
+        string.format("[%09.3f] %s", now, cleanMessage))
+    while table.getn(state.debugLines) > DEBUG_HISTORY_LIMIT do
+        table.remove(state.debugLines, 1)
+    end
+    state.debugDirty = true
+end
 
 local validAnchorPoints = {
     TOPLEFT = true,
@@ -410,6 +457,174 @@ local function CreateAALScrollbar(parent, scrollFrame, content)
     scrollbar:SetScript("OnSizeChanged", UpdateThumb)
     scrollbar.Update = UpdateThumb
     return scrollbar
+end
+
+RefreshDebugLog = function(scrollToBottom)
+    if not debugEditBox or not debugFrame or not debugFrame:IsShown() then return end
+    local text = table.concat(state.debugLines, "\n")
+    debugEditBox:SetText(text)
+    local lineCount = math.max(1, table.getn(state.debugLines))
+    local viewHeight = debugFrame.scrollFrame:GetHeight() or 1
+    debugEditBox:SetHeight(math.max(viewHeight, lineCount * DEBUG_LINE_HEIGHT + 8))
+    debugFrame.scrollFrame:UpdateScrollChildRect()
+    if scrollToBottom then
+        -- Vanilla updates a ScrollFrame's range over several frames after its
+        -- EditBox changes. Follow the bottom until that range has settled.
+        debugFrame.scrollToBottomFrames = 3
+    end
+    if debugFrame.scrollbar then debugFrame.scrollbar:Update() end
+    state.debugDirty = false
+end
+
+local function UpdateDebugTitle()
+    if not debugFrame or not debugFrame.title then return end
+    debugFrame.title:SetText("AutoAreaLoot Debug - "
+        .. (state.debugEnabled and "CAPTURING" or "PAUSED"))
+end
+
+local function CreateDebugWindow()
+    if debugFrame then return end
+
+    debugFrame = CreateFrame("Frame", "AutoAreaLootDebugFrame", UIParent)
+    debugFrame:SetWidth(560)
+    debugFrame:SetHeight(300)
+    debugFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 20)
+    debugFrame:SetFrameStrata("DIALOG")
+    debugFrame:SetToplevel(true)
+    debugFrame:SetMovable(true)
+    debugFrame:EnableMouse(true)
+    debugFrame:RegisterForDrag("LeftButton")
+    debugFrame:SetScript("OnDragStart", function() this:StartMoving() end)
+    debugFrame:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
+    ApplyThemeBackdrop(debugFrame, 0.94, true)
+
+    local header = debugFrame:CreateTexture(nil, "BACKGROUND")
+    header:SetTexture("Interface\\Buttons\\WHITE8X8")
+    header:SetPoint("TOPLEFT", debugFrame, "TOPLEFT", 1, -1)
+    header:SetPoint("TOPRIGHT", debugFrame, "TOPRIGHT", -1, -1)
+    header:SetHeight(34)
+    if IsPfUIThemeActive() then
+        local r, g, b = GetThemeBackgroundColor()
+        header:SetVertexColor(r, g, b, 0.75)
+    else
+        header:SetVertexColor(0.090, 0.153, 0.243, 0.55)
+    end
+
+    local accent = debugFrame:CreateTexture(nil, "BORDER")
+    accent:SetTexture("Interface\\Buttons\\WHITE8X8")
+    accent:SetPoint("TOPLEFT", debugFrame, "TOPLEFT", 1, -1)
+    accent:SetPoint("TOPRIGHT", debugFrame, "TOPRIGHT", -1, -1)
+    accent:SetHeight(2)
+    local accentR, accentG, accentB = GetThemeAccentColor()
+    accent:SetVertexColor(accentR, accentG, accentB, 0.85)
+
+    debugFrame.title = debugFrame:CreateFontString(
+        nil, "ARTWORK", "GameFontNormalLarge")
+    debugFrame.title:SetPoint("TOP", debugFrame, "TOP", 0, -11)
+    ApplyLootFont(debugFrame.title, 12)
+    debugFrame.title:SetTextColor(0.902, 0.929, 0.953, 1)
+
+    local close = CreateAALButton(debugFrame, 18, 18, "X")
+    close:SetPoint("TOPRIGHT", debugFrame, "TOPRIGHT", -6, -6)
+    ApplyLootFont(close.label, 9)
+    StyleCloseButton(close)
+    close:SetScript("OnClick", function() this:GetParent():Hide() end)
+
+    local scrollFrame = CreateFrame(
+        "ScrollFrame", "AutoAreaLootDebugScrollFrame", debugFrame)
+    scrollFrame:SetPoint("TOPLEFT", debugFrame, "TOPLEFT", 10, -42)
+    scrollFrame:SetPoint("BOTTOMRIGHT", debugFrame, "BOTTOMRIGHT", -24, 32)
+    debugFrame.scrollFrame = scrollFrame
+
+    debugEditBox = CreateFrame(
+        "EditBox", "AutoAreaLootDebugEditBox", scrollFrame)
+    debugEditBox:SetWidth(516)
+    debugEditBox:SetHeight(220)
+    debugEditBox:SetMultiLine(true)
+    debugEditBox:SetMaxLetters(0)
+    debugEditBox:SetAutoFocus(false)
+    debugEditBox:EnableMouse(true)
+    ApplyLootFont(debugEditBox, 10)
+    debugEditBox:SetTextColor(0.820, 0.870, 0.920, 1)
+    debugEditBox:SetScript("OnEscapePressed", function() this:ClearFocus() end)
+    scrollFrame:SetScrollChild(debugEditBox)
+    debugFrame.scrollbar = CreateAALScrollbar(
+        debugFrame, scrollFrame, debugEditBox)
+
+    local clear = CreateAALButton(debugFrame, 46, 18, "Clear")
+    clear:SetPoint("BOTTOMLEFT", debugFrame, "BOTTOMLEFT", 10, 7)
+    clear:SetScript("OnClick", function()
+        state.debugLines = {}
+        RefreshDebugLog(false)
+    end)
+
+    local selectAll = CreateAALButton(debugFrame, 66, 18, "Select All")
+    selectAll:SetPoint("LEFT", clear, "RIGHT", 6, 0)
+    selectAll:SetScript("OnClick", function()
+        state.debugEnabled = false
+        debugFrame.pauseButton.label:SetText("Resume")
+        UpdateDebugTitle()
+        RefreshDebugLog(false)
+        debugEditBox:SetFocus()
+        debugEditBox:HighlightText()
+    end)
+
+    local pause = CreateAALButton(debugFrame, 78, 18, "Pause")
+    pause:SetPoint("LEFT", selectAll, "RIGHT", 6, 0)
+    pause:SetScript("OnClick", function()
+        state.debugEnabled = not state.debugEnabled
+        this.label:SetText(state.debugEnabled and "Pause" or "Resume")
+        UpdateDebugTitle()
+        if state.debugEnabled then DebugLog("Debug capture resumed") end
+    end)
+    debugFrame.pauseButton = pause
+
+    local hint = debugFrame:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+    hint:SetPoint("BOTTOMRIGHT", debugFrame, "BOTTOMRIGHT", -10, 10)
+    ApplyLootFont(hint, 9)
+    hint:SetTextColor(0.55, 0.62, 0.70, 1)
+    hint:SetText("Select All pauses capture; then Ctrl+C")
+
+    debugFrame:SetScript("OnShow", function()
+        debugFrame.debugRefreshElapsed = 0
+        UpdateDebugTitle()
+        debugFrame.pauseButton.label:SetText(
+            state.debugEnabled and "Pause" or "Resume")
+        RefreshDebugLog(true)
+    end)
+    debugFrame:SetScript("OnUpdate", function()
+        this.debugRefreshElapsed = (this.debugRefreshElapsed or 0) + arg1
+        if state.debugDirty and this.debugRefreshElapsed >= 0.10 then
+            this.debugRefreshElapsed = 0
+            RefreshDebugLog(true)
+        end
+        if this.scrollToBottomFrames and this.scrollToBottomFrames > 0 then
+            local scrollFrame = this.scrollFrame
+            scrollFrame:UpdateScrollChildRect()
+            local maximum
+            if type(scrollFrame.GetVerticalScrollRange) == "function" then
+                maximum = scrollFrame:GetVerticalScrollRange()
+            else
+                maximum = math.max(0,
+                    (debugEditBox:GetHeight() or 1)
+                    - (scrollFrame:GetHeight() or 1))
+            end
+            scrollFrame:SetVerticalScroll(math.max(0, maximum or 0))
+            if type(scrollFrame.Scroll) == "function" then
+                scrollFrame:Scroll()
+            end
+            if this.scrollbar then this.scrollbar:Update() end
+            this.scrollToBottomFrames = this.scrollToBottomFrames - 1
+        end
+    end)
+    debugFrame:Hide()
+end
+
+local function ShowDebugWindow()
+    CreateDebugWindow()
+    debugFrame:Show()
+    UpdateDebugTitle()
+    RefreshDebugLog(true)
 end
 
 local function StopLootRowHighlight(row)
@@ -806,6 +1021,7 @@ local function ParseSelfLootMessage(message)
 end
 
 local function RemovePendingCapture(capture)
+    capture.expirationToken = nil
     for index = table.getn(state.pendingCaptures), 1, -1 do
         if state.pendingCaptures[index] == capture then
             table.remove(state.pendingCaptures, index)
@@ -818,6 +1034,8 @@ local function PrunePendingCaptures()
     for index = table.getn(state.pendingCaptures), 1, -1 do
         local capture = state.pendingCaptures[index]
         if capture.expiresAt and capture.expiresAt <= now then
+            DebugLog("Confirmation window expired; dropping unmatched expectations")
+            capture.expirationToken = nil
             table.remove(state.pendingCaptures, index)
         end
     end
@@ -835,14 +1053,17 @@ end
 
 local function ConsumeItemConfirmation(capture, confirmation)
     local remaining = capture.expectedItems[confirmation.itemID] or 0
-    if remaining <= 0 then return false end
+    if remaining <= 0 then return false, confirmation.count end
 
     local confirmed = math.min(remaining, confirmation.count)
     local key = string.match(confirmation.label, "|H(item:[^|]+)|h")
         or confirmation.itemID
     AddLootItem(confirmation.label, key, confirmed)
     capture.expectedItems[confirmation.itemID] = remaining - confirmed
-    return true
+    DebugLog("Item confirmed: item=" .. confirmation.itemID
+        .. " count=" .. confirmed .. " remaining="
+        .. capture.expectedItems[confirmation.itemID])
+    return true, confirmation.count - confirmed
 end
 
 local function ConsumeMoneyConfirmation(capture, amount)
@@ -858,78 +1079,156 @@ local function ConsumeMoneyConfirmation(capture, amount)
             consumed = true
         end
     end
-    return consumed
-end
-
-local function ConsumeCaptureEvent(capture, captureEvent)
-    if captureEvent.kind == "item" then
-        return ConsumeItemConfirmation(capture, captureEvent)
-    elseif captureEvent.kind == "money" then
-        return ConsumeMoneyConfirmation(capture, captureEvent.amount)
-    end
-    return false
+    DebugLog("Money confirmation: gained=" .. (tonumber(amount) or 0)
+        .. " matched=" .. (consumed and "yes" or "no")
+        .. " unmatched=" .. remainingAmount)
+    return consumed, remainingAmount
 end
 
 local function MatchPendingEvent(captureEvent)
     PrunePendingCaptures()
-    for _, capture in ipairs(state.pendingCaptures) do
-        if ConsumeCaptureEvent(capture, captureEvent) then
-            if not CaptureHasExpectedLoot(capture) then
-                RemovePendingCapture(capture)
-            end
-            RefreshLootLog()
-            return true
+    DebugLog("Matching " .. captureEvent.kind .. " confirmation against "
+        .. table.getn(state.pendingCaptures) .. " completed capture(s)")
+
+    local remaining
+    if captureEvent.kind == "item" then
+        remaining = math.max(1, tonumber(captureEvent.count) or 1)
+    elseif captureEvent.kind == "money" then
+        remaining = math.max(0, tonumber(captureEvent.amount) or 0)
+    else
+        return false
+    end
+
+    local matched = false
+    local index = 1
+    while index <= table.getn(state.pendingCaptures) and remaining > 0 do
+        local capture = state.pendingCaptures[index]
+        local consumed
+        if captureEvent.kind == "item" then
+            local confirmation = {
+                itemID = captureEvent.itemID,
+                label = captureEvent.label,
+                count = remaining,
+            }
+            consumed, remaining = ConsumeItemConfirmation(capture, confirmation)
+        else
+            consumed, remaining = ConsumeMoneyConfirmation(capture, remaining)
+        end
+
+        if consumed then matched = true end
+        if not CaptureHasExpectedLoot(capture) then
+            capture.expirationToken = nil
+            table.remove(state.pendingCaptures, index)
+        else
+            index = index + 1
         end
     end
-    return false
+
+    if matched then
+        RefreshLootLog()
+    end
+    if remaining > 0 then
+        DebugLog("Confirmation remainder did not match corpse scans: kind="
+            .. captureEvent.kind .. " amount=" .. remaining)
+    end
+    if not matched then
+        DebugLog("Confirmation did not match any pending corpse scan")
+    end
+    return matched
 end
 
 local function BufferOrMatchCaptureEvent(captureEvent)
     if state.activeCapture then
         table.insert(state.activeCapture.events, captureEvent)
+        DebugLog("Buffered " .. captureEvent.kind
+            .. " confirmation while corpse scan is active")
         return
     end
     MatchPendingEvent(captureEvent)
+end
+
+local function GetLiveCaptureGuids()
+    local liveGuids = {}
+    for _, pendingCapture in ipairs(state.pendingCaptures) do
+        for guid in pairs(pendingCapture.guids or {}) do
+            liveGuids[guid] = true
+        end
+    end
+    return liveGuids
+end
+
+local function ShortCorpseGuid(guid)
+    if type(guid) ~= "string" then return "unknown" end
+    if string.len(guid) <= 10 then return guid end
+    return "..." .. string.sub(guid, -8)
 end
 
 local function CompleteLootCapture(capture, results)
     PrunePendingCaptures()
     capture.expectedItems = {}
     capture.expectedMoney = {}
+    capture.guids = {}
 
+    local scannedCorpseCount = 0
+    local corpseCount = 0
+    local duplicateCorpseCount = 0
+    local itemCount = 0
+    local moneyCount = 0
+    local liveGuids = GetLiveCaptureGuids()
     for _, corpse in ipairs(results or {}) do
-        local coin = math.max(0, tonumber(corpse.coin) or 0)
-        if coin > 0 then
-            table.insert(capture.expectedMoney, { remaining = coin })
-        end
-        for _, item in ipairs(corpse.items or {}) do
-            local itemID = tonumber(item.itemID)
-            if itemID then
-                capture.expectedItems[itemID] =
-                    (capture.expectedItems[itemID] or 0)
-                    + math.max(1, tonumber(item.count) or 1)
+        scannedCorpseCount = scannedCorpseCount + 1
+        local guid = type(corpse.guid) == "string" and corpse.guid or nil
+        if guid and liveGuids[guid] then
+            duplicateCorpseCount = duplicateCorpseCount + 1
+            DebugLog("Duplicate corpse expectations skipped: guid="
+                .. ShortCorpseGuid(guid))
+        else
+            corpseCount = corpseCount + 1
+            if guid then
+                capture.guids[guid] = true
+                liveGuids[guid] = true
+            end
+            DebugLog("Corpse expectations accepted: guid="
+                .. ShortCorpseGuid(guid))
+            local coin = math.max(0, tonumber(corpse.coin) or 0)
+            if coin > 0 then
+                table.insert(capture.expectedMoney, { remaining = coin })
+                moneyCount = moneyCount + coin
+            end
+            for _, item in ipairs(corpse.items or {}) do
+                local itemID = tonumber(item.itemID)
+                if itemID then
+                    local count = math.max(1, tonumber(item.count) or 1)
+                    capture.expectedItems[itemID] =
+                        (capture.expectedItems[itemID] or 0) + count
+                    itemCount = itemCount + count
+                end
             end
         end
     end
+
+    DebugLog("Scan results prepared: scanned=" .. scannedCorpseCount
+        .. " accepted=" .. corpseCount
+        .. " duplicates=" .. duplicateCorpseCount
+        .. " items=" .. itemCount .. " money=" .. moneyCount
+        .. " bufferedEvents=" .. table.getn(capture.events))
 
     capture.expiresAt = (type(GetTime) == "function" and GetTime() or 0)
         + LOOT_CONFIRM_GRACE
     table.insert(state.pendingCaptures, capture)
     while table.getn(state.pendingCaptures) > 8 do
-        table.remove(state.pendingCaptures, 1)
+        RemovePendingCapture(state.pendingCaptures[1])
     end
     for _, captureEvent in ipairs(capture.events) do
-        if not ConsumeCaptureEvent(capture, captureEvent) then
-            -- A confirmation delayed from the preceding walk may arrive
-            -- while a new walk is active. Give unmatched events to an older
-            -- still-live expectation instead of dropping them.
-            MatchPendingEvent(captureEvent)
-        end
+        -- Captures are ordered oldest first. This lets delayed loot from a
+        -- preceding walk consume its expectations before the new walk's.
+        MatchPendingEvent(captureEvent)
     end
     capture.events = {}
     RefreshLootLog()
 
     if not CaptureHasExpectedLoot(capture) then
+        DebugLog("Capture complete; all expected loot already confirmed")
         RemovePendingCapture(capture)
         return
     end
@@ -940,9 +1239,11 @@ local function CompleteLootCapture(capture, results)
         C_Timer.After(LOOT_CONFIRM_GRACE, function()
             if capture.expirationToken ~= expirationToken then return end
             capture.expirationToken = nil
+            DebugLog("Confirmation grace timer ended; removing capture")
             RemovePendingCapture(capture)
         end)
     else
+        DebugLog("No timer API; removing pending confirmation capture")
         RemovePendingCapture(capture)
     end
 end
@@ -981,6 +1282,7 @@ local function CreateLootLog()
         AutoAreaLootDB.lootLogX,
         AutoAreaLootDB.lootLogY)
     lootLogFrame:SetFrameStrata("DIALOG")
+    lootLogFrame:SetToplevel(true)
     lootLogFrame:SetMovable(true)
     lootLogFrame:SetResizable(true)
     if lootLogFrame.SetMinResize then
@@ -1180,6 +1482,72 @@ local function IsPlayerInCombat()
     return type(UnitAffectingCombat) == "function" and UnitAffectingCombat("player")
 end
 
+local function GetPlayerSpeedMovementState()
+    if type(GetUnitSpeed) ~= "function" then return nil end
+    local ok, speed = pcall(GetUnitSpeed, "player")
+    speed = tonumber(speed)
+    if not ok or not speed then return nil end
+    return speed > MOVEMENT_SPEED_EPSILON
+end
+
+local function IsPlayerCurrentlyMoving()
+    local moving = GetPlayerSpeedMovementState()
+    if moving ~= nil then
+        return moving
+    end
+    return state.playerMoving and true or false
+end
+
+local function GetUnitWorldPosition(unit)
+    if type(UnitPosition) ~= "function" then return nil end
+    local ok, first, second, third = pcall(UnitPosition, unit)
+    if not ok then return nil end
+    local x = tonumber(first)
+    local y = tonumber(second)
+    local z = tonumber(third) or 0
+    if not x or not y then return nil end
+    -- ClassicAPI and SuperWoW differ in axis labels, but Euclidean distance
+    -- is unchanged when the first two world axes are swapped.
+    return x, y, z
+end
+
+local function GetPlayerWorldPosition()
+    return GetUnitWorldPosition("player")
+end
+
+local function GetUnitDistanceFromPlayer(unit)
+    if type(UnitDistanceSquared) == "function" then
+        local ok, distanceSquared, checked = pcall(UnitDistanceSquared, unit)
+        distanceSquared = tonumber(distanceSquared)
+        if ok and checked and distanceSquared and distanceSquared >= 0 then
+            return math.sqrt(distanceSquared)
+        end
+    end
+
+    local unitX, unitY, unitZ = GetUnitWorldPosition(unit)
+    local playerX, playerY, playerZ = GetPlayerWorldPosition()
+    if not unitX or not playerX then return nil end
+    local dx = unitX - playerX
+    local dy = unitY - playerY
+    local dz = unitZ - playerZ
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
+local function ShouldAcceptDeathTrigger(guid)
+    if type(guid) ~= "string" then return true, nil end
+    local distance = GetUnitDistanceFromPlayer(guid)
+    if not distance then return true, nil end
+    return distance <= DEATH_TRIGGER_DISTANCE_LIMIT, distance
+end
+
+local function GetDistanceFromLastStop(x, y, z)
+    if not x or not state.lastStopPositionX then return nil end
+    local dx = x - state.lastStopPositionX
+    local dy = y - state.lastStopPositionY
+    local dz = z - state.lastStopPositionZ
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
 local function IsLootScanInProgress()
     if not C_Loot or type(C_Loot.IsScanInProgress) ~= "function" then
         return false
@@ -1189,76 +1557,322 @@ local function IsLootScanInProgress()
 end
 
 local CompleteActiveLootWalk
+local ScheduleLootRequest
 
-local function LootNearbyCorpses()
-    if not state.initialized or not AutoAreaLootDB.enabled or not HasClassicAPILoot() then return false end
+local function NormalizePendingLootReason(source)
+    local reason = source
+    if reason ~= "death" and reason ~= "moved" then
+        reason = "retry"
+    end
+    return reason
+end
+
+local function QueuePendingLootRequest(source)
+    local reason = NormalizePendingLootReason(source)
+    local currentPriority = PENDING_LOOT_PRIORITY[state.pendingLootReason] or 0
+    if PENDING_LOOT_PRIORITY[reason] > currentPriority then
+        state.pendingLootReason = reason
+    end
+end
+
+local function GetLootSettleDelay()
+    if not state.lootSettleUntil or type(GetTime) ~= "function" then return 0 end
+    local remaining = state.lootSettleUntil - GetTime()
+    if remaining <= 0 then
+        state.lootSettleUntil = nil
+        return 0
+    end
+    return remaining
+end
+
+local function GetAdaptiveLootSettleDuration()
+    local latency
+    if type(GetNetStats) == "function" then
+        local ok, bandwidthIn, bandwidthOut, thirdLatency, fourthLatency =
+            pcall(GetNetStats)
+        if ok then
+            -- Vanilla reports latency as the third value. Clients exposing the
+            -- newer home/world pair use the fourth value for world latency.
+            latency = tonumber(fourthLatency) or tonumber(thirdLatency)
+        end
+    end
+
+    local duration = POST_SCAN_SETTLE_MIN
+    if latency and latency >= 0 then
+        duration = POST_SCAN_SETTLE_CUSHION
+            + (latency / 1000) * POST_SCAN_LATENCY_MULTIPLIER
+    end
+    duration = math.max(POST_SCAN_SETTLE_MIN,
+        math.min(POST_SCAN_SETTLE_MAX, duration))
+    return duration, latency
+end
+
+local function LootNearbyCorpses(source)
+    source = source or "retry"
+    DebugLog("Loot request entered: source=" .. source .. " enabled="
+        .. tostring(state.initialized and AutoAreaLootDB.enabled)
+        .. " manual=" .. tostring(state.manualLootOpen)
+        .. " localWalk=" .. tostring(state.lootWalkActive)
+        .. " apiScan=" .. tostring(IsLootScanInProgress())
+        .. " combat=" .. tostring(IsPlayerInCombat()))
+    if not state.initialized then
+        DebugLog("Loot request stopped: addon not initialized")
+        return false
+    end
+    if not AutoAreaLootDB.enabled then
+        DebugLog("Loot request stopped: addon disabled")
+        return false
+    end
+    if not HasClassicAPILoot() then
+        DebugLog("Loot request stopped: ClassicAPI loot API unavailable")
+        return false
+    end
+
+    if state.stopGraceTimer then
+        QueuePendingLootRequest(source)
+        DebugLog("Loot request deferred: waiting for stable-stop grace; source="
+            .. source)
+        return false
+    end
+
+    if IsPlayerCurrentlyMoving() then
+        QueuePendingLootRequest(source)
+        DebugLog("Loot request deferred: player is moving; source=" .. source)
+        return false
+    end
+
+    if source == "stop" and state.lootRequestTimer then
+        DebugLog("Stop request coalesced into pending scheduled request")
+        return false
+    end
 
     if IsPlayerInCombat() and not AutoAreaLootDB.lootInCombat then
-        state.pendingLootRequest = true
+        QueuePendingLootRequest(source)
+        DebugLog("Loot request deferred: combat looting disabled")
         return false
     end
 
     if state.manualLootOpen then
-        state.pendingLootRequest = true
+        QueuePendingLootRequest(source)
+        DebugLog("Loot request deferred: manual loot window is open")
         return false
     end
 
     if state.lootWalkActive then
         if IsLootScanInProgress() then
-            state.pendingLootRequest = true
+            QueuePendingLootRequest(source)
+            DebugLog("Loot request deferred: our ClassicAPI walk is still active; source="
+                .. source)
             return false
         end
         -- Recover if a later trigger notices that the completion event was
         -- missed after ClassicAPI already returned to idle.
+        DebugLog("Recovering local walk after ClassicAPI returned idle")
         CompleteActiveLootWalk()
+        if state.pendingLootReason then
+            local pendingReason = state.pendingLootReason
+            state.pendingLootReason = nil
+            DebugLog("Recovered completion: preserving queued request; source="
+                .. pendingReason)
+            ScheduleLootRequest(
+                pendingReason == "death" and DEATH_LOOT_REQUEST_DELAY or nil,
+                pendingReason)
+            return false
+        end
     end
 
     if IsLootScanInProgress() then
-        state.pendingLootRequest = true
+        QueuePendingLootRequest(source)
+        DebugLog("Loot request deferred: another ClassicAPI scan is active")
         return false
     end
 
-    state.pendingLootRequest = false
+    local settleDelay = GetLootSettleDelay()
+    if settleDelay > 0 then
+        local sourceReason = NormalizePendingLootReason(source)
+        if sourceReason == "retry" then
+            if state.pendingLootReason then
+                local pendingReason = state.pendingLootReason
+                state.pendingLootReason = nil
+                DebugLog("Successful scan is settling; scheduling queued request; source="
+                    .. pendingReason)
+                ScheduleLootRequest(settleDelay, pendingReason)
+                return false
+            end
+            DebugLog("Loot request coalesced: successful scan is still settling; source="
+                .. source)
+            return false
+        end
+        QueuePendingLootRequest(source)
+        DebugLog("Loot request deferred: waiting "
+            .. string.format("%.3f", settleDelay)
+            .. " seconds for corpse state to settle")
+        ScheduleLootRequest(settleDelay, source)
+        return false
+    end
+
+    state.pendingLootReason = nil
     local capture = { events = {} }
     state.activeCapture = capture
     state.lootWalkActive = true
+    state.lootWalkStartedAt = type(GetTime) == "function" and GetTime() or nil
+    DebugLog("Calling C_Loot.LootAllCorpses")
     local callOK, callResult = pcall(C_Loot.LootAllCorpses)
     local started = callOK and callResult and true or false
-    if started then
-        state.lootRequestTimer = nil
-    else
+    DebugLog("LootAllCorpses returned: callOK=" .. tostring(callOK)
+        .. " result=" .. tostring(callResult)
+        .. " apiScan=" .. tostring(IsLootScanInProgress()))
+    if not started then
         if state.activeCapture == capture then
             state.activeCapture = nil
             state.lootWalkActive = false
+            state.lootWalkStartedAt = nil
         end
         if IsLootScanInProgress() then
-            state.pendingLootRequest = true
+            QueuePendingLootRequest(source)
+            DebugLog("Failed call left API scan active; queued one follow-up")
         end
     end
     return started
 end
 
-local function ScheduleLootRequest()
-    if not state.initialized or not AutoAreaLootDB.enabled then return end
-    if state.lootRequestTimer then return end
-    if not HasClassicAPILoot() or not C_Timer or type(C_Timer.After) ~= "function" then return end
+ScheduleLootRequest = function(delay, source)
+    source = source or "retry"
+    if not state.initialized then
+        DebugLog("Schedule skipped: addon not initialized")
+        return
+    end
+    if not AutoAreaLootDB.enabled then
+        DebugLog("Schedule skipped: addon disabled")
+        return
+    end
+    if IsPlayerCurrentlyMoving() then
+        QueuePendingLootRequest(source)
+        DebugLog("Schedule deferred while player is moving; source=" .. source)
+        return
+    end
+    local settleDelay = GetLootSettleDelay()
+    local sourceReason = NormalizePendingLootReason(source)
+    if settleDelay > 0 and sourceReason == "retry" then
+        DebugLog("Schedule coalesced: successful scan is settling; source="
+            .. source)
+        return
+    end
+    if state.lootRequestTimer then
+        local timerReason = NormalizePendingLootReason(
+            state.lootRequestTimer.source)
+        if PENDING_LOOT_PRIORITY[sourceReason]
+            > PENDING_LOOT_PRIORITY[timerReason] then
+            DebugLog("Scheduled request upgraded: " .. timerReason
+                .. " -> " .. sourceReason)
+            state.lootRequestTimer = nil
+        else
+            DebugLog("Schedule coalesced: request timer already pending; source="
+                .. state.lootRequestTimer.source)
+            return
+        end
+    end
+    if not HasClassicAPILoot() then
+        DebugLog("Schedule skipped: ClassicAPI loot API unavailable")
+        return
+    end
+    if not C_Timer or type(C_Timer.After) ~= "function" then
+        DebugLog("Schedule skipped: C_Timer.After unavailable")
+        return
+    end
+
+    local requestedDelay = math.max(0, tonumber(delay) or LOOT_REQUEST_DELAY)
+    local effectiveDelay = math.max(requestedDelay, settleDelay)
 
     -- One timer per burst; invalidated tokens cannot service a later request.
-    local token = {}
+    local token = { source = source }
     state.lootRequestTimer = token
-    C_Timer.After(LOOT_REQUEST_DELAY, function()
-        if state.lootRequestTimer ~= token then return end
+    DebugLog("Loot request scheduled in "
+        .. string.format("%.3f", effectiveDelay) .. " seconds; source=" .. source)
+    C_Timer.After(effectiveDelay, function()
+        if state.lootRequestTimer ~= token then
+            DebugLog("Scheduled request discarded: timer token invalidated")
+            return
+        end
         state.lootRequestTimer = nil
-        LootNearbyCorpses()
+        DebugLog("Scheduled loot request fired; source=" .. token.source)
+        LootNearbyCorpses(token.source)
+    end)
+end
+
+local function ScheduleStableStopLoot(source)
+    source = source or "stop"
+    if not C_Timer or type(C_Timer.After) ~= "function" then
+        DebugLog("Stop grace unavailable; servicing request immediately")
+        LootNearbyCorpses(source)
+        return
+    end
+
+    local startX, startY, startZ = GetPlayerWorldPosition()
+    local token = {
+        source = source,
+        startX = startX,
+        startY = startY,
+        startZ = startZ,
+    }
+    state.stopGraceTimer = token
+    DebugLog("Waiting " .. string.format("%.3f", STOP_LOOT_GRACE)
+        .. " seconds for a stable stop; source=" .. source)
+    C_Timer.After(STOP_LOOT_GRACE, function()
+        if state.stopGraceTimer ~= token then
+            DebugLog("Stable-stop request discarded: token invalidated")
+            return
+        end
+        state.stopGraceTimer = nil
+        if IsPlayerCurrentlyMoving() then
+            QueuePendingLootRequest(token.source)
+            DebugLog("Stable-stop request deferred: movement-start event received")
+            return
+        end
+        local currentX, currentY, currentZ = GetPlayerWorldPosition()
+        if token.startX and currentX then
+            local dx = currentX - token.startX
+            local dy = currentY - token.startY
+            local dz = currentZ - token.startZ
+            local moved = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if moved > STOP_LOOT_GRACE_MOVEMENT_TOLERANCE then
+                state.playerMoving = true
+                QueuePendingLootRequest(token.source)
+                DebugLog("Stable-stop request deferred: moved "
+                    .. string.format("%.2f", moved)
+                    .. " yards during grace")
+                return
+            end
+        end
+
+        local effectiveSource = token.source
+        local pendingReason = state.pendingLootReason
+        local effectiveReason = NormalizePendingLootReason(effectiveSource)
+        if pendingReason and PENDING_LOOT_PRIORITY[pendingReason]
+            > PENDING_LOOT_PRIORITY[effectiveReason] then
+            effectiveSource = pendingReason
+        end
+        DebugLog("Stable stop confirmed; servicing source=" .. effectiveSource)
+        LootNearbyCorpses(effectiveSource)
     end)
 end
 
 CompleteActiveLootWalk = function()
-    if not state.lootWalkActive then return false end
+    if not state.lootWalkActive then
+        DebugLog("Completion ignored: no local corpse walk is active")
+        return false
+    end
 
     local capture = state.activeCapture
+    local completedAt = type(GetTime) == "function" and GetTime() or nil
+    local scanDuration
+    if completedAt and state.lootWalkStartedAt then
+        scanDuration = math.max(0, completedAt - state.lootWalkStartedAt)
+    end
     state.lootWalkActive = false
+    state.lootWalkStartedAt = nil
     state.activeCapture = nil
+    DebugLog("Completing local corpse walk; capture=" .. tostring(capture ~= nil))
 
     if capture then
         local results = {}
@@ -1266,27 +1880,79 @@ CompleteActiveLootWalk = function()
             local resultsOK, returnedResults = pcall(C_Loot.GetLastScanResults)
             if resultsOK and type(returnedResults) == "table" then
                 results = returnedResults
+                DebugLog("GetLastScanResults returned "
+                    .. table.getn(results) .. " corpse result(s)")
+            else
+                DebugLog("GetLastScanResults failed or returned no table: "
+                    .. tostring(returnedResults))
+            end
+        else
+            DebugLog("GetLastScanResults is unavailable")
+        end
+        if table.getn(results) > 0 and type(GetTime) == "function" then
+            local settleDuration, latency =
+                GetAdaptiveLootSettleDuration()
+            state.lootSettleUntil = GetTime() + settleDuration
+            DebugLog("Non-empty scan: latency=" .. tostring(latency or "unknown")
+                .. "ms scanTime=" .. string.format("%.3f", scanDuration or 0)
+                .. "s settling=" .. string.format("%.3f", settleDuration)
+                .. " seconds")
+            if state.pendingLootReason == "retry" then
+                state.pendingLootReason = nil
+                DebugLog("Discarded redundant stop/combat follow-up after successful scan")
             end
         end
         -- Any logging failure ends here and cannot affect looting.
-        pcall(CompleteLootCapture, capture, results)
+        local captureOK, captureError = pcall(CompleteLootCapture, capture, results)
+        if not captureOK then
+            DebugLog("Loot logger completion failed: " .. tostring(captureError))
+        end
     end
     return true
 end
 
 local function ServicePendingLootRequest()
-    if state.pendingLootRequest then
-        state.pendingLootRequest = false
-        ScheduleLootRequest()
+    if not state.pendingLootReason then
+        DebugLog("No queued loot request to service")
+        return
     end
+    if IsPlayerCurrentlyMoving() then
+        DebugLog("Queued loot request retained while player is moving; source="
+            .. state.pendingLootReason)
+        return
+    end
+    if state.stopGraceTimer then
+        DebugLog("Queued loot request retained during stable-stop grace; source="
+            .. state.pendingLootReason)
+        return
+    end
+    if state.lootWalkActive or IsLootScanInProgress() then
+        DebugLog("Queued loot request retained behind active scan; source="
+            .. state.pendingLootReason)
+        return
+    end
+
+    local source = state.pendingLootReason
+    state.pendingLootReason = nil
+    DebugLog("Servicing queued loot request; source=" .. source)
+    ScheduleLootRequest(
+        source == "death" and DEATH_LOOT_REQUEST_DELAY or nil, source)
 end
 
 local function SetEnabled(enabled)
     AutoAreaLootDB.enabled = enabled and true or false
+    DebugLog("Addon enabled set to " .. tostring(AutoAreaLootDB.enabled))
     if not AutoAreaLootDB.enabled then
         state.lootRequestTimer = nil
-        state.pendingLootRequest = false
+        state.lootSettleUntil = nil
+        state.pendingLootReason = nil
         state.lootAfterCombat = false
+        state.lootWalkStartedAt = nil
+        state.stopGraceTimer = nil
+        state.lastStopLootRequestAt = nil
+        state.lastStopPositionX = nil
+        state.lastStopPositionY = nil
+        state.lastStopPositionZ = nil
     end
 end
 
@@ -1318,6 +1984,7 @@ local function CreateConfigPanel()
     configFrame:SetHeight(186)
     configFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 80)
     configFrame:SetFrameStrata("DIALOG")
+    configFrame:SetToplevel(true)
     configFrame:SetMovable(true)
     configFrame:EnableMouse(true)
     configFrame:RegisterForDrag("LeftButton")
@@ -1386,6 +2053,68 @@ local function ShowConfigPanel()
     end
 end
 
+local function HandlePlayerMovementStarted(source)
+    state.playerMoving = true
+    state.movementStateKnown = true
+    if state.stopGraceTimer then
+        state.stopGraceTimer = nil
+        DebugLog("Movement resumed: cancelled stable-stop grace; source="
+            .. source)
+    else
+        DebugLog("Movement started; source=" .. source)
+    end
+end
+
+local function HandlePlayerMovementStopped(source)
+    state.playerMoving = false
+    state.movementStateKnown = true
+    if AutoAreaLootDB.lootOnStop then
+        DebugLog("Stop trigger accepted; source=" .. source)
+        local now = type(GetTime) == "function" and GetTime() or nil
+        local x, y, z = GetPlayerWorldPosition()
+        local moved = GetDistanceFromLastStop(x, y, z)
+        local elapsed = now and state.lastStopLootRequestAt
+            and now - state.lastStopLootRequestAt or nil
+        local withinSameArea = not moved
+            or moved < STOP_LOOT_MOVEMENT_DISTANCE
+        local withinCooldown = elapsed
+            and elapsed < STOP_LOOT_SAME_AREA_INTERVAL
+        local coalesced = withinSameArea and withinCooldown
+        if coalesced then
+            DebugLog("Stop trigger coalesced: elapsed="
+                .. (elapsed and string.format("%.3f", elapsed) or "unknown")
+                .. " moved=" .. (moved and string.format("%.2f", moved)
+                    or "unknown") .. " yards")
+            if state.pendingLootReason then
+                ScheduleStableStopLoot(state.pendingLootReason)
+            end
+            return
+        end
+        state.lastStopLootRequestAt = now
+        if x then
+            state.lastStopPositionX = x
+            state.lastStopPositionY = y
+            state.lastStopPositionZ = z
+        end
+        if moved then
+            DebugLog("Stop trigger position accepted: moved="
+                .. string.format("%.2f", moved) .. " yards")
+        end
+        if IsPlayerInCombat() then
+            state.lootAfterCombat = true
+            DebugLog("Stop trigger marked a post-combat pass")
+        end
+        local stopSource = moved
+            and moved >= STOP_LOOT_MOVEMENT_DISTANCE and "moved" or "stop"
+        ScheduleStableStopLoot(stopSource)
+    else
+        DebugLog("Stop trigger ignored: setting disabled")
+        if state.pendingLootReason then
+            ScheduleStableStopLoot(state.pendingLootReason)
+        end
+    end
+end
+
 eventFrame = CreateFrame("Frame")
 
 eventFrame:RegisterEvent("ADDON_LOADED")
@@ -1396,9 +2125,6 @@ eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
 eventFrame:RegisterEvent("CHAT_MSG_LOOT")
 eventFrame:RegisterEvent("PLAYER_MONEY")
-if IsEventAvailable("PLAYER_STOPPED_MOVING") then
-    eventFrame:RegisterEvent("PLAYER_STOPPED_MOVING")
-end
 if IsEventAvailable("LOOT_SCAN_COMPLETED") then
     eventFrame:RegisterEvent("LOOT_SCAN_COMPLETED")
 end
@@ -1413,6 +2139,7 @@ eventFrame:SetScript("OnEvent", function()
         if arg1 == "AutoAreaLoot" then
             InitializeSettings()
             InitializeLootPatterns()
+            state.useSpeedMovement = type(GetUnitSpeed) == "function"
             state.moneyBaseline = SafeGetMoney()
             CreateConfigPanel()
             eventFrame:UnregisterEvent("ADDON_LOADED")
@@ -1424,12 +2151,25 @@ eventFrame:SetScript("OnEvent", function()
         return
     end
 
+    DebugLog("Event received: " .. tostring(event))
+
     if event == "PLAYER_LEAVING_WORLD" then
+        DebugLog("Leaving world: clearing transient loot state")
         state.lootRequestTimer = nil
-        state.pendingLootRequest = false
+        state.lootSettleUntil = nil
+        state.pendingLootReason = nil
         state.lootAfterCombat = false
         state.manualLootOpen = false
         state.lootWalkActive = false
+        state.lootWalkStartedAt = nil
+        state.playerMoving = false
+        state.movementStateKnown = false
+        state.movementSampleElapsed = 0
+        state.stopGraceTimer = nil
+        state.lastStopLootRequestAt = nil
+        state.lastStopPositionX = nil
+        state.lastStopPositionY = nil
+        state.lastStopPositionZ = nil
         state.activeCapture = nil
         state.pendingCaptures = {}
         state.moneyBaseline = nil
@@ -1437,65 +2177,110 @@ eventFrame:SetScript("OnEvent", function()
     end
 
     if event == "PLAYER_REGEN_ENABLED" then
-        if state.lootAfterCombat or state.pendingLootRequest then
-            state.lootAfterCombat = false
-            state.pendingLootRequest = false
-            ScheduleLootRequest()
-        end
-        return
-    end
-
-    if event == "PLAYER_STOPPED_MOVING" then
-        if AutoAreaLootDB.lootOnStop then
-            if IsPlayerInCombat() then
-                state.lootAfterCombat = true
+        if state.lootAfterCombat or state.pendingLootReason then
+            DebugLog("Combat ended: preserving one deferred loot request")
+            if state.lootAfterCombat then
+                QueuePendingLootRequest("retry")
             end
-            LootNearbyCorpses()
+            state.lootAfterCombat = false
+            ServicePendingLootRequest()
+        else
+            DebugLog("Combat ended: no deferred loot request")
         end
         return
     end
 
     if event == "UNIT_DIED" or event == "CHAT_MSG_COMBAT_HOSTILE_DEATH" then
         if AutoAreaLootDB.lootOnDeath then
+            local deathGuid = event == "UNIT_DIED" and arg1 or nil
+            local accepted, distance = ShouldAcceptDeathTrigger(deathGuid)
+            if not accepted then
+                DebugLog("Death trigger ignored: guid="
+                    .. ShortCorpseGuid(deathGuid) .. " distance="
+                    .. string.format("%.2f", distance)
+                    .. " yards exceeds " .. DEATH_TRIGGER_DISTANCE_LIMIT)
+                return
+            end
+            DebugLog("Death trigger accepted: guid="
+                .. ShortCorpseGuid(deathGuid) .. " distance="
+                .. (distance and string.format("%.2f", distance) or "unknown"))
             if IsPlayerInCombat() then
                 state.lootAfterCombat = true
+                DebugLog("Death trigger marked a post-combat pass")
             end
-            ScheduleLootRequest()
+            if state.stopGraceTimer or state.lootWalkActive
+                or IsLootScanInProgress() then
+                QueuePendingLootRequest("death")
+                DebugLog("Death trigger queued behind active scan or stop grace")
+            else
+                ScheduleLootRequest(DEATH_LOOT_REQUEST_DELAY, "death")
+            end
+        else
+            DebugLog("Death trigger ignored: setting disabled")
         end
         return
     end
 
     if event == "LOOT_OPENED" then
         state.manualLootOpen = true
+        DebugLog("Manual loot window marked open")
         return
     end
 
     if event == "LOOT_CLOSED" then
         state.manualLootOpen = false
+        DebugLog("Manual loot window marked closed")
         ServicePendingLootRequest()
         return
     end
 
     if event == "PLAYER_ENTERING_WORLD" then
         state.moneyBaseline = SafeGetMoney()
+        state.playerMoving = false
+        state.movementStateKnown = false
+        state.movementSampleElapsed = 0
+        state.stopGraceTimer = nil
+        state.lastStopLootRequestAt = nil
+        state.lastStopPositionX = nil
+        state.lastStopPositionY = nil
+        state.lastStopPositionZ = nil
+        DebugLog("Entered world: money baseline=" .. tostring(state.moneyBaseline))
         return
     end
 
     if event == "CHAT_MSG_LOOT" then
         local parseOK, confirmation = pcall(ParseSelfLootMessage, arg1)
+        DebugLog("Loot chat parse: ok=" .. tostring(parseOK)
+            .. " selfItem=" .. tostring(confirmation ~= nil))
         if parseOK and confirmation then
-            pcall(BufferOrMatchCaptureEvent, confirmation)
+            local matchOK, matchError = pcall(
+                BufferOrMatchCaptureEvent, confirmation)
+            if not matchOK then
+                DebugLog("Loot confirmation handler failed: "
+                    .. tostring(matchError))
+            end
+        elseif not parseOK then
+            DebugLog("Loot chat parser failed: " .. tostring(confirmation))
         end
         return
     end
 
     if event == "PLAYER_MONEY" then
         local currentMoney = SafeGetMoney()
+        DebugLog("Money event: before=" .. tostring(state.moneyBaseline)
+            .. " after=" .. tostring(currentMoney))
         if currentMoney ~= nil and state.moneyBaseline ~= nil then
             local gained = currentMoney - state.moneyBaseline
             if gained > 0 then
-                pcall(BufferOrMatchCaptureEvent,
+                DebugLog("Positive money change detected: " .. gained)
+                local matchOK, matchError = pcall(BufferOrMatchCaptureEvent,
                     { kind = "money", amount = gained })
+                if not matchOK then
+                    DebugLog("Money confirmation handler failed: "
+                        .. tostring(matchError))
+                end
+            else
+                DebugLog("Money change was not a gain: " .. gained)
             end
         end
         state.moneyBaseline = currentMoney
@@ -1503,11 +2288,34 @@ eventFrame:SetScript("OnEvent", function()
     end
 
     if event == "LOOT_SCAN_COMPLETED" then
+        DebugLog("ClassicAPI reported LOOT_SCAN_COMPLETED")
         CompleteActiveLootWalk()
         ServicePendingLootRequest()
         return
     end
 
+end)
+
+eventFrame:SetScript("OnUpdate", function()
+    if not state.initialized or not state.useSpeedMovement then return end
+    state.movementSampleElapsed = state.movementSampleElapsed + arg1
+    if state.movementSampleElapsed < MOVEMENT_SAMPLE_INTERVAL then return end
+    state.movementSampleElapsed = 0
+
+    local moving = GetPlayerSpeedMovementState()
+    if moving == nil then return end
+    if not state.movementStateKnown then
+        state.playerMoving = moving
+        state.movementStateKnown = true
+        DebugLog("Speed movement baseline: moving=" .. tostring(moving))
+        return
+    end
+    if moving == state.playerMoving then return end
+    if moving then
+        HandlePlayerMovementStarted("speed")
+    else
+        HandlePlayerMovementStopped("speed")
+    end
 end)
 
 SLASH_AUTOAREA_LOOT1 = "/aal"
@@ -1532,6 +2340,24 @@ SlashCmdList["AUTOAREA_LOOT"] = function(message)
             .. ".")
     elseif command == "log" then
         ShowLootLog()
+    elseif command == "debug" or command == "debug on" then
+        state.debugEnabled = true
+        DebugLog("Debug capture enabled")
+        ShowDebugWindow()
+        DEFAULT_CHAT_FRAME:AddMessage(
+            "AutoAreaLoot: debug capture enabled. Use /aal debug off to stop it.")
+    elseif command == "debug off" then
+        DebugLog("Debug capture disabled")
+        state.debugEnabled = false
+        UpdateDebugTitle()
+        if debugFrame and debugFrame.pauseButton then
+            debugFrame.pauseButton.label:SetText("Resume")
+        end
+        DEFAULT_CHAT_FRAME:AddMessage("AutoAreaLoot: debug capture disabled.")
+    elseif command == "debug clear" then
+        state.debugLines = {}
+        RefreshDebugLog(false)
+        DEFAULT_CHAT_FRAME:AddMessage("AutoAreaLoot: debug log cleared.")
     else
         ShowConfigPanel()
     end
