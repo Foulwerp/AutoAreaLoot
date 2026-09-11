@@ -21,7 +21,7 @@ local LOOT_LOG_MIN_WIDTH = 240
 local LOOT_LOG_MIN_HEIGHT = 140
 local DEBUG_HISTORY_LIMIT = 300
 local DEBUG_LINE_HEIGHT = 12
-local PENDING_LOOT_PRIORITY = { retry = 1, moved = 2, death = 3 }
+local PENDING_LOOT_PRIORITY = { retry = 1, combat = 2, moved = 3, death = 4 }
 local LOOT_FONT = "Interface\\AddOns\\AutoAreaLoot\\Fonts\\PTSansNarrow.ttf"
 local LOOT_FONT_FALLBACK = "Fonts\\FRIZQT__.TTF"
 local CIRCLE_TEXTURE = "Interface\\AddOns\\AutoAreaLoot\\Icons\\Circle.tga"
@@ -1134,17 +1134,25 @@ local function MatchPendingEvent(captureEvent)
     if not matched then
         DebugLog("Confirmation did not match any pending corpse scan")
     end
-    return matched
+    return matched, remaining
 end
 
 local function BufferOrMatchCaptureEvent(captureEvent)
+    -- Delayed confirmations must reach earlier captures before they expire,
+    -- even when another walk is still running.
+    local _, remaining = MatchPendingEvent(captureEvent)
+    if not remaining or remaining <= 0 then return end
     if state.activeCapture then
+        if captureEvent.kind == "item" then
+            captureEvent.count = remaining
+        else
+            captureEvent.amount = remaining
+        end
         table.insert(state.activeCapture.events, captureEvent)
         DebugLog("Buffered " .. captureEvent.kind
             .. " confirmation while corpse scan is active")
         return
     end
-    MatchPendingEvent(captureEvent)
 end
 
 local function GetLiveCaptureGuids()
@@ -1561,7 +1569,7 @@ local ScheduleLootRequest
 
 local function NormalizePendingLootReason(source)
     local reason = source
-    if reason ~= "death" and reason ~= "moved" then
+    if reason ~= "death" and reason ~= "moved" and reason ~= "combat" then
         reason = "retry"
     end
     return reason
@@ -2057,6 +2065,7 @@ local function HandlePlayerMovementStarted(source)
     state.playerMoving = true
     state.movementStateKnown = true
     if state.stopGraceTimer then
+        QueuePendingLootRequest(state.stopGraceTimer.source)
         state.stopGraceTimer = nil
         DebugLog("Movement resumed: cancelled stable-stop grace; source="
             .. source)
@@ -2180,7 +2189,7 @@ eventFrame:SetScript("OnEvent", function()
         if state.lootAfterCombat or state.pendingLootReason then
             DebugLog("Combat ended: preserving one deferred loot request")
             if state.lootAfterCombat then
-                QueuePendingLootRequest("retry")
+                QueuePendingLootRequest("combat")
             end
             state.lootAfterCombat = false
             ServicePendingLootRequest()
