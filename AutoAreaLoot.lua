@@ -45,6 +45,7 @@ local defaults = {
 local state = {
     initialized = false,
     manualLootOpen = false,
+    autoLootWindowOpen = false,
     pendingLootReason = nil,
     lootAfterCombat = false,
     lootRequestTimer = nil,
@@ -2272,6 +2273,7 @@ eventFrame:SetScript("OnEvent", function()
         state.pendingLootReason = nil
         state.lootAfterCombat = false
         state.manualLootOpen = false
+        state.autoLootWindowOpen = false
         state.lootWalkActive = false
         state.lootWalkStartedAt = nil
         state.playerMoving = false
@@ -2350,13 +2352,25 @@ eventFrame:SetScript("OnEvent", function()
     end
 
     if event == "LOOT_OPENED" then
-        state.manualLootOpen = true
-        DebugLog("Manual loot window marked open")
+        if state.lootWalkActive then
+            state.autoLootWindowOpen = true
+            DebugLog("Loot window opened during automatic walk; closing it")
+            if type(CloseLoot) == "function" then
+                pcall(CloseLoot)
+            else
+                state.manualLootOpen = true
+                DebugLog("CloseLoot is unavailable; treating window as manual")
+            end
+        else
+            state.manualLootOpen = true
+            DebugLog("Manual loot window marked open")
+        end
         return
     end
 
     if event == "LOOT_CLOSED" then
         state.manualLootOpen = false
+        state.autoLootWindowOpen = false
         DebugLog("Manual loot window marked closed")
         ServicePendingLootRequest()
         return
