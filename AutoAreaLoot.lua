@@ -1472,6 +1472,7 @@ end
 
 local eventFrame
 local missingClassicAPIWarningShown = false
+local missingNampowerWarningShown = false
 
 local function IsEventAvailable(eventName)
     return C_EventUtils
@@ -2186,6 +2187,11 @@ if IsEventAvailable("UNIT_DIED") then
     eventFrame:RegisterEvent("UNIT_DIED")
 else
     eventFrame:RegisterEvent("CHAT_MSG_COMBAT_HOSTILE_DEATH")
+    if not missingNampowerWarningShown then
+        missingNampowerWarningShown = true
+        DEFAULT_CHAT_FRAME:AddMessage(
+            "AutoAreaLoot: Nampower is recommended for reliable death detection; using combat-text fallback.")
+    end
 end
 
 eventFrame:SetScript("OnEvent", function()
