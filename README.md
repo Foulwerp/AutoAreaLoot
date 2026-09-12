@@ -48,7 +48,7 @@ Nampower is optional. When its `UNIT_DIED` event is available, the addon uses it
 
 ## Installation
 
-Use the Twow/Octowow launcher and choose **Add Addon from Git**. Use:
+In the launcher, choose **Add Addon from Git** and use:
 
 ```text
 https://github.com/Foulwerp/AutoAreaLoot.git
