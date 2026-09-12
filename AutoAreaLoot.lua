@@ -10,6 +10,7 @@ local MOVEMENT_SAMPLE_INTERVAL = 0.10
 local MOVEMENT_SPEED_EPSILON = 0.01
 local STOP_LOOT_SAME_AREA_INTERVAL = 0.50
 local STOP_LOOT_MOVEMENT_DISTANCE = 5
+local CHANNEL_SAMPLE_INTERVAL = 0.10
 -- The engine's loot test includes creature reach. This deliberately generous
 -- center-distance limit rejects only deaths that are clearly too far away.
 local DEATH_TRIGGER_DISTANCE_LIMIT = 8
@@ -58,6 +59,9 @@ local state = {
     movementStateKnown = false,
     movementSampleElapsed = 0,
     playerMoving = false,
+    channelStateKnown = false,
+    channelSampleElapsed = 0,
+    playerChanneling = false,
     stopGraceTimer = nil,
     lastStopLootRequestAt = nil,
     lastStopPositionX = nil,
@@ -1956,7 +1960,17 @@ local function ServicePendingLootRequest()
             .. state.pendingLootReason)
         return
     end
-    if state.lootWalkActive or IsLootScanInProgress() then
+    if state.lootWalkActive then
+        if IsLootScanInProgress() then
+            DebugLog("Queued loot request retained behind active scan; source="
+                .. state.pendingLootReason)
+            return
+        end
+        -- Recover if the scan completed but its completion event was missed.
+        DebugLog("Recovering queued request after ClassicAPI returned idle")
+        CompleteActiveLootWalk()
+    end
+    if IsLootScanInProgress() then
         DebugLog("Queued loot request retained behind active scan; source="
             .. state.pendingLootReason)
         return
@@ -2205,6 +2219,9 @@ eventFrame:SetScript("OnEvent", function()
         state.playerMoving = false
         state.movementStateKnown = false
         state.movementSampleElapsed = 0
+        state.channelStateKnown = false
+        state.channelSampleElapsed = 0
+        state.playerChanneling = false
         state.stopGraceTimer = nil
         state.lastStopLootRequestAt = nil
         state.lastStopPositionX = nil
@@ -2279,6 +2296,9 @@ eventFrame:SetScript("OnEvent", function()
         state.playerMoving = false
         state.movementStateKnown = false
         state.movementSampleElapsed = 0
+        state.channelStateKnown = false
+        state.channelSampleElapsed = 0
+        state.playerChanneling = false
         state.stopGraceTimer = nil
         state.lastStopLootRequestAt = nil
         state.lastStopPositionX = nil
@@ -2347,7 +2367,27 @@ eventFrame:SetScript("OnEvent", function()
 end)
 
 eventFrame:SetScript("OnUpdate", function()
-    if not state.initialized or not state.useSpeedMovement then return end
+    if not state.initialized then return end
+
+    state.channelSampleElapsed = state.channelSampleElapsed + arg1
+    if state.channelSampleElapsed >= CHANNEL_SAMPLE_INTERVAL then
+        state.channelSampleElapsed = 0
+        local channeling = IsPlayerChanneling()
+        if not state.channelStateKnown then
+            state.playerChanneling = channeling
+            state.channelStateKnown = true
+        elseif channeling ~= state.playerChanneling then
+            state.playerChanneling = channeling
+            if channeling then
+                DebugLog("Player channel started")
+            else
+                DebugLog("Player channel ended; servicing deferred loot")
+                ServicePendingLootRequest()
+            end
+        end
+    end
+
+    if not state.useSpeedMovement then return end
     state.movementSampleElapsed = state.movementSampleElapsed + arg1
     if state.movementSampleElapsed < MOVEMENT_SAMPLE_INTERVAL then return end
     state.movementSampleElapsed = 0
