@@ -1490,6 +1490,12 @@ local function IsPlayerInCombat()
     return type(UnitAffectingCombat) == "function" and UnitAffectingCombat("player")
 end
 
+local function IsPlayerChanneling()
+    if type(UnitChannelInfo) ~= "function" then return false end
+    local ok, channelName = pcall(UnitChannelInfo, "player")
+    return ok and channelName ~= nil
+end
+
 local function GetPlayerSpeedMovementState()
     if type(GetUnitSpeed) ~= "function" then return nil end
     local ok, speed = pcall(GetUnitSpeed, "player")
@@ -1649,6 +1655,12 @@ local function LootNearbyCorpses(source)
         return false
     end
 
+    if IsPlayerChanneling() then
+        QueuePendingLootRequest(source)
+        DebugLog("Loot request deferred: player is channeling; source=" .. source)
+        return false
+    end
+
     if source == "stop" and state.lootRequestTimer then
         DebugLog("Stop request coalesced into pending scheduled request")
         return false
@@ -1757,6 +1769,11 @@ ScheduleLootRequest = function(delay, source)
     if IsPlayerCurrentlyMoving() then
         QueuePendingLootRequest(source)
         DebugLog("Schedule deferred while player is moving; source=" .. source)
+        return
+    end
+    if IsPlayerChanneling() then
+        QueuePendingLootRequest(source)
+        DebugLog("Schedule deferred while player is channeling; source=" .. source)
         return
     end
     local settleDelay = GetLootSettleDelay()
@@ -1926,6 +1943,11 @@ local function ServicePendingLootRequest()
     end
     if IsPlayerCurrentlyMoving() then
         DebugLog("Queued loot request retained while player is moving; source="
+            .. state.pendingLootReason)
+        return
+    end
+    if IsPlayerChanneling() then
+        DebugLog("Queued loot request retained while player is channeling; source="
             .. state.pendingLootReason)
         return
     end
@@ -2137,6 +2159,15 @@ eventFrame:RegisterEvent("PLAYER_MONEY")
 if IsEventAvailable("LOOT_SCAN_COMPLETED") then
     eventFrame:RegisterEvent("LOOT_SCAN_COMPLETED")
 end
+if IsEventAvailable("UNIT_SPELLCAST_CHANNEL_STOP") then
+    eventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_STOP")
+end
+if IsEventAvailable("UNIT_SPELLCAST_CHANNEL_INTERRUPTED") then
+    eventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_INTERRUPTED")
+end
+if IsEventAvailable("UNIT_SPELLCAST_CHANNEL_FAILED") then
+    eventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_FAILED")
+end
 if IsEventAvailable("UNIT_DIED") then
     eventFrame:RegisterEvent("UNIT_DIED")
 else
@@ -2300,6 +2331,16 @@ eventFrame:SetScript("OnEvent", function()
         DebugLog("ClassicAPI reported LOOT_SCAN_COMPLETED")
         CompleteActiveLootWalk()
         ServicePendingLootRequest()
+        return
+    end
+
+    if event == "UNIT_SPELLCAST_CHANNEL_STOP"
+        or event == "UNIT_SPELLCAST_CHANNEL_INTERRUPTED"
+        or event == "UNIT_SPELLCAST_CHANNEL_FAILED" then
+        if arg1 == "player" then
+            DebugLog("Player channel ended; servicing deferred loot")
+            ServicePendingLootRequest()
+        end
         return
     end
 
