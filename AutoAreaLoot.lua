@@ -6,11 +6,11 @@ local POST_SCAN_SETTLE_CUSHION = 0.25
 local POST_SCAN_LATENCY_MULTIPLIER = 2
 local STOP_LOOT_GRACE = 0.15
 local STOP_LOOT_GRACE_MOVEMENT_TOLERANCE = 0.20
-local MOVEMENT_SAMPLE_INTERVAL = 0.10
 local MOVEMENT_SPEED_EPSILON = 0.01
 local STOP_LOOT_SAME_AREA_INTERVAL = 0.50
 local STOP_LOOT_MOVEMENT_DISTANCE = 5
-local CHANNEL_SAMPLE_INTERVAL = 0.10
+local PLAYER_STATE_SAMPLE_INTERVAL = 0.10
+local LOOT_SCAN_TIMEOUT = 6.0
 -- The engine's loot test includes creature reach. This deliberately generous
 -- center-distance limit rejects only deaths that are clearly too far away.
 local DEATH_TRIGGER_DISTANCE_LIMIT = 8
@@ -57,11 +57,11 @@ local state = {
     lootWalkStartedAt = nil,
     useSpeedMovement = false,
     movementStateKnown = false,
-    movementSampleElapsed = 0,
     playerMoving = false,
     channelStateKnown = false,
-    channelSampleElapsed = 0,
+    playerStateSampleElapsed = 0,
     playerChanneling = false,
+    playerControlLost = false,
     stopGraceTimer = nil,
     lastStopLootRequestAt = nil,
     lastStopPositionX = nil,
@@ -1501,6 +1501,26 @@ local function IsPlayerChanneling()
     return ok and channelName ~= nil
 end
 
+local function IsPlayerCasting()
+    if type(UnitCastingInfo) ~= "function" then return false end
+    local ok, castName = pcall(UnitCastingInfo, "player")
+    return ok and castName ~= nil
+end
+
+local function IsPlayerDeadOrGhost()
+    if type(UnitIsDeadOrGhost) ~= "function" then return false end
+    local ok, deadOrGhost = pcall(UnitIsDeadOrGhost, "player")
+    return ok and deadOrGhost and true or false
+end
+
+local function GetPlayerLootRestriction()
+    if state.playerControlLost then return "player control is lost" end
+    if IsPlayerDeadOrGhost() then return "player is dead or a ghost" end
+    if IsPlayerChanneling() then return "player is channeling" end
+    if IsPlayerCasting() then return "player is casting" end
+    return nil
+end
+
 local function GetPlayerSpeedMovementState()
     if type(GetUnitSpeed) ~= "function" then return nil end
     local ok, speed = pcall(GetUnitSpeed, "player")
@@ -1660,9 +1680,10 @@ local function LootNearbyCorpses(source)
         return false
     end
 
-    if IsPlayerChanneling() then
+    local restriction = GetPlayerLootRestriction()
+    if restriction then
         QueuePendingLootRequest(source)
-        DebugLog("Loot request deferred: player is channeling; source=" .. source)
+        DebugLog("Loot request deferred: " .. restriction .. "; source=" .. source)
         return false
     end
 
@@ -1776,9 +1797,10 @@ ScheduleLootRequest = function(delay, source)
         DebugLog("Schedule deferred while player is moving; source=" .. source)
         return
     end
-    if IsPlayerChanneling() then
+    local restriction = GetPlayerLootRestriction()
+    if restriction then
         QueuePendingLootRequest(source)
-        DebugLog("Schedule deferred while player is channeling; source=" .. source)
+        DebugLog("Schedule deferred while " .. restriction .. "; source=" .. source)
         return
     end
     local settleDelay = GetLootSettleDelay()
@@ -1951,8 +1973,9 @@ local function ServicePendingLootRequest()
             .. state.pendingLootReason)
         return
     end
-    if IsPlayerChanneling() then
-        DebugLog("Queued loot request retained while player is channeling; source="
+    local restriction = GetPlayerLootRestriction()
+    if restriction then
+        DebugLog("Queued loot request retained while " .. restriction .. "; source="
             .. state.pendingLootReason)
         return
     end
@@ -1984,6 +2007,27 @@ local function ServicePendingLootRequest()
         source == "death" and DEATH_LOOT_REQUEST_DELAY or nil, source)
 end
 
+local function RecoverTimedOutLootWalk()
+    if not state.lootWalkActive or not state.lootWalkStartedAt
+        or type(GetTime) ~= "function" then
+        return
+    end
+
+    local elapsed = GetTime() - state.lootWalkStartedAt
+    if elapsed < LOOT_SCAN_TIMEOUT then return end
+
+    if IsLootScanInProgress() then
+        DebugLog("Loot walk exceeded timeout but ClassicAPI still reports it active")
+        return
+    end
+
+    DebugLog("Recovering loot walk after "
+        .. string.format("%.3f", elapsed)
+        .. " seconds without a completion event")
+    CompleteActiveLootWalk()
+    ServicePendingLootRequest()
+end
+
 local function SetEnabled(enabled)
     AutoAreaLootDB.enabled = enabled and true or false
     DebugLog("Addon enabled set to " .. tostring(AutoAreaLootDB.enabled))
@@ -1992,7 +2036,9 @@ local function SetEnabled(enabled)
         state.lootSettleUntil = nil
         state.pendingLootReason = nil
         state.lootAfterCombat = false
+        state.lootWalkActive = false
         state.lootWalkStartedAt = nil
+        state.activeCapture = nil
         state.stopGraceTimer = nil
         state.lastStopLootRequestAt = nil
         state.lastStopPositionX = nil
@@ -2183,6 +2229,12 @@ end
 if IsEventAvailable("UNIT_SPELLCAST_CHANNEL_FAILED") then
     eventFrame:RegisterEvent("UNIT_SPELLCAST_CHANNEL_FAILED")
 end
+if IsEventAvailable("PLAYER_CONTROL_LOST") then
+    eventFrame:RegisterEvent("PLAYER_CONTROL_LOST")
+end
+if IsEventAvailable("PLAYER_CONTROL_GAINED") then
+    eventFrame:RegisterEvent("PLAYER_CONTROL_GAINED")
+end
 if IsEventAvailable("UNIT_DIED") then
     eventFrame:RegisterEvent("UNIT_DIED")
 else
@@ -2224,10 +2276,10 @@ eventFrame:SetScript("OnEvent", function()
         state.lootWalkStartedAt = nil
         state.playerMoving = false
         state.movementStateKnown = false
-        state.movementSampleElapsed = 0
         state.channelStateKnown = false
-        state.channelSampleElapsed = 0
+        state.playerStateSampleElapsed = 0
         state.playerChanneling = false
+        state.playerControlLost = false
         state.stopGraceTimer = nil
         state.lastStopLootRequestAt = nil
         state.lastStopPositionX = nil
@@ -2250,6 +2302,19 @@ eventFrame:SetScript("OnEvent", function()
         else
             DebugLog("Combat ended: no deferred loot request")
         end
+        return
+    end
+
+    if event == "PLAYER_CONTROL_LOST" then
+        state.playerControlLost = true
+        DebugLog("Player control lost; deferring loot")
+        return
+    end
+
+    if event == "PLAYER_CONTROL_GAINED" then
+        state.playerControlLost = false
+        DebugLog("Player control gained; servicing deferred loot")
+        ServicePendingLootRequest()
         return
     end
 
@@ -2301,10 +2366,10 @@ eventFrame:SetScript("OnEvent", function()
         state.moneyBaseline = SafeGetMoney()
         state.playerMoving = false
         state.movementStateKnown = false
-        state.movementSampleElapsed = 0
         state.channelStateKnown = false
-        state.channelSampleElapsed = 0
+        state.playerStateSampleElapsed = 0
         state.playerChanneling = false
+        state.playerControlLost = false
         state.stopGraceTimer = nil
         state.lastStopLootRequestAt = nil
         state.lastStopPositionX = nil
@@ -2375,9 +2440,10 @@ end)
 eventFrame:SetScript("OnUpdate", function()
     if not state.initialized then return end
 
-    state.channelSampleElapsed = state.channelSampleElapsed + arg1
-    if state.channelSampleElapsed >= CHANNEL_SAMPLE_INTERVAL then
-        state.channelSampleElapsed = 0
+    state.playerStateSampleElapsed = state.playerStateSampleElapsed + arg1
+    if state.playerStateSampleElapsed >= PLAYER_STATE_SAMPLE_INTERVAL then
+        state.playerStateSampleElapsed = 0
+        RecoverTimedOutLootWalk()
         local channeling = IsPlayerChanneling()
         if not state.channelStateKnown then
             state.playerChanneling = channeling
@@ -2394,10 +2460,6 @@ eventFrame:SetScript("OnUpdate", function()
     end
 
     if not state.useSpeedMovement then return end
-    state.movementSampleElapsed = state.movementSampleElapsed + arg1
-    if state.movementSampleElapsed < MOVEMENT_SAMPLE_INTERVAL then return end
-    state.movementSampleElapsed = 0
-
     local moving = GetPlayerSpeedMovementState()
     if moving == nil then return end
     if not state.movementStateKnown then
